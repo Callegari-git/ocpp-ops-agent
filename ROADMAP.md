@@ -25,16 +25,16 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 - [x] Run the Mobility House OCPP 1.6 central system + charge point examples locally and watch BootNotification / Heartbeat flow
 - [x] Repo skeleton: `pyproject.toml`, `src/` layout, ruff, pytest, pytest-asyncio
-- [ ] GitHub Actions CI (lint + tests) running on every push (workflow written; tick after the first green run)
+- [x] GitHub Actions CI (lint + tests) running on every push (workflow written; tick after the first green run)
 - [x] Minimal README, including the "no TotalEnergies data, config or code" statement
 - [x] `.gitignore` (incl. `logs/`), MIT license
 
 ### CSMS
 
-- [ ] Handlers: BootNotification, Heartbeat, StatusNotification, MeterValues
-- [ ] In-memory charger registry: status per connector, last heartbeat, known config
+- [x] Handlers: BootNotification, Heartbeat, StatusNotification, MeterValues
+- [x] In-memory charger registry: status per connector, last heartbeat, known config
 - [ ] Outbound commands: GetConfiguration, ChangeConfiguration, Reset (future agent tools)
-- [ ] JSONL logging of every message in and out
+- [x] JSONL logging of every message in and out
 
 ### Virtual charger
 
@@ -137,11 +137,19 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 | 2026-11-24 | Dependencies capped at the current major version; ruff pinned exactly | Avoid unannounced breakage (already hit a master-vs-PyPI mismatch with the `ocpp` examples); new ruff releases change rules/formatting and would break CI on untouched code |
 | 2026-11-24 | Plain `websockets` for the CSMS, not FastAPI | OCPP-J is WebSocket-only and the `ocpp` library works directly with `websockets` connections. Revisit only if we need an HTTP API later |
 | 2026-11-24 | `hatchling` as build backend; CI matrix Python 3.11 / 3.12 / 3.13 | Minimal config for a src/ layout; 3.13 is the local dev version |
+| 2026-11-24 | JSONL logging via a `LoggingConnection` wrapper around the websocket (logs in `recv()`/`send()`), not by overriding `ChargePoint` internals | `ChargePoint` only calls `recv()`/`send()` on its connection, so the wrapper sees every frame and survives library upgrades. Outgoing frames are logged *before* sending, so a fast reply can always be matched to its CALL |
+| 2026-11-24 | Injected clock (`now` function) in the registry, handlers and log | Tests control time; a simulated clock can replace real time later without touching callers |
+| 2026-11-24 | Each connection gets a registry token; a close only marks the charger disconnected if its token is still the current one | A charger can reconnect before its old connection is detected as dead; the old one closing must not mark the live one offline |
+| 2026-11-24 | Connector state keeps both the charger's `timestamp` and our `received_at` | Makes the week-2 clock-drift fault observable |
+| 2026-11-24 | Unparseable frames are logged as `INVALID` with the raw text, not dropped | The audit trail must contain everything that crossed the wire |
 
 ## Open questions
 
 - Simulated clock vs real time for heartbeats and timeouts? (Real time is simpler; a simulated clock makes the evaluation much faster.)
 - Which LLM(s) to evaluate in week 4, and with what budget per incident?
+- Messages before an accepted BootNotification: the CSMS currently accepts them. Should it reject them (OCPP 1.6 §4.2)? Decide in week 2 together with the Pending/Rejected boot faults.
+- Connect/disconnect events are not in the JSONL log (only OCPP frames are). The agent will need them for the week-2 reconnect-loop fault: add them as their own record type?
+- SIGTERM (Docker stop, week 5) is not handled yet; only Ctrl+C/SIGINT shuts down cleanly.
 
 ## References (inspiration only)
 
