@@ -1,0 +1,55 @@
+[build-system]
+# >=1.27 for PEP 639 license metadata (license = "MIT" + license-files).
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ocpp-ops-agent"
+version = "0.1.0"
+description = "OCPP 1.6J charging-station fleet simulator with fault injection, and an AI ops agent benchmarked against rules."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sébastien Callegari" }]
+requires-python = ">=3.11"
+# Capped at the current major version: a breaking release must be adopted on purpose.
+dependencies = [
+    "ocpp>=2.1,<3",
+    "websockets>=17,<18",
+    "pydantic>=2.14,<3",
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.2,<10",
+    "pytest-asyncio>=1.5,<2",
+    # Pinned exactly: new ruff releases add rules / formatting changes that would break CI.
+    "ruff==0.17.6",
+]
+
+# Distribution name (ocpp-ops-agent) differs from the import name (ocpp_ops),
+# so tell hatchling where the package lives.
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocpp_ops"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "ASYNC", # blocking calls inside coroutines
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

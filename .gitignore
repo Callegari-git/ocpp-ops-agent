@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Project
+logs/
+
+# Local Claude Code settings (the shared .claude/settings.json stays tracked)
+.claude/settings.local.json
+
+# OS
+.DS_Store
