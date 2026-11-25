@@ -7,6 +7,7 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 - **Budget:** 5 weeks, ~15–20 h/week (80–100 h total)
 - **Target:** public v1 (repo + demo video + results + article) before end of January 2027
 - **Started:** 2026-11-24
+- **Last updated:** 2026-11-24
 
 ## Success metrics (to publish)
 
@@ -38,10 +39,10 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 ### Virtual charger
 
-- [ ] Explicit state machine (Available, Preparing, Charging, SuspendedEV, SuspendedEVSE, Finishing, Unavailable, Faulted), single transition point
-- [ ] Config store with standard 1.6 keys (HeartbeatInterval, MeterValueSampleInterval, ConnectionTimeOut, ...)
-- [ ] Boot → heartbeat loop → status notifications on transitions
-- [ ] Respond correctly to GetConfiguration, ChangeConfiguration, Reset
+- [x] Explicit state machine (Available, Preparing, Charging, SuspendedEV, SuspendedEVSE, Finishing, Unavailable, Faulted), single transition point
+- [x] Config store with standard 1.6 keys (HeartbeatInterval, MeterValueSampleInterval, ConnectionTimeOut, ...)
+- [x] Boot → heartbeat loop → status notifications on transitions
+- [x] Respond correctly to GetConfiguration, ChangeConfiguration, Reset
 
 ### Fleet
 
@@ -65,6 +66,7 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 **Done when:** 10–15 faults can be injected by name and seed, each with known ground truth, and each one is reproducible.
 
+- [ ] Charging sessions: CSMS handlers (Authorize, StartTransaction, StopTransaction, MeterValues during a transaction) + virtual charger sessions (Preparing → Charging → Finishing through `set_status`). Needed first: the "no reboot during a session" guardrail and several faults depend on it
 - [ ] Fault spec format: id, injected cause, observable symptoms, ground-truth fix, verification check
 - [ ] Injection engine (hooks into the charger state machine / config / connection)
 - [ ] Ground truth stored separately from what the agent can see
@@ -148,6 +150,14 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 | 2026-11-24 | `known_config` stores value **and** readonly per key | The agent must know a key is read-only before trying to change it |
 | 2026-11-24 | CONNECTED / DISCONNECTED events in the same JSONL file, same line shape (`direction`/`message_id`/`action` null); disconnect reason `clean` / `network_drop` (code 1006) / `error` | One format for readers; the agent needs connection history for the reconnect-loop fault |
 | 2026-11-24 | Pending CALL ids in the log wrapper expire after 2 × call timeout | Unanswered CALLs would otherwise accumulate for the life of the connection; 2× (not 1×) so a late answer is still logged with its action |
+| 2026-11-24 | Connector transitions as a table (`ALLOWED_TRANSITIONS`, from OCPP 1.6 §4.9), no Reserved; connector 0 limited to Available/Unavailable/Faulted; same-status re-report allowed; Faulted requires an error code | One readable source of truth, testable on its own; reservations are out of scope. Table to be checked cell by cell against the spec PDF |
+| 2026-11-24 | `VirtualCharger.set_status()` is the only path for status changes; connector state is a frozen dataclass, replaced not edited | Week 2's fault engine hooks in at one place; nothing can change a status behind its back |
+| 2026-11-24 | Charger takes injected `now`, `sleep` and a seeded `random.Random`; tests use `ManualTime` (virtual time that moves only when the test advances it) | Fast tests with exact timing assertions, and reproducible runs. A first step toward the simulated-clock open question |
+| 2026-11-24 | Charger message ids come from the seeded RNG (passed via `call(unique_id=...)`) instead of ocpp's default `uuid4()` | Same seed must give the same run, message ids included |
+| 2026-11-24 | Reconnect backoff: `min(60, 2^failures) × uniform(0.5, 1.0)` s from the seeded RNG; not websockets' built-in reconnect loop | Jitter avoids a fleet reconnecting in lockstep; the built-in loop uses real `asyncio.sleep` and unseeded randomness |
+| 2026-11-24 | ChangeConfiguration rejects badly formatted values (non-integer / negative ints, non-boolean bools) | A value the charger itself cannot use (e.g. `HeartbeatInterval=abc`) must not crash it |
+| 2026-11-24 | Charger config persists across Reset (lives on the charger, not the connection); connector statuses are kept too | Non-volatile on real chargers; otherwise a reset would silently "fix" config faults. What a reboot clears is decided per fault in week 2 |
+| 2026-11-24 | On Ctrl+C the charger closes with 1001 (going away) | websockets closes with 1011 (internal error) when an exception leaves the connection block; the CSMS would log a clean stop as an error |
 
 ## Open questions
 
@@ -157,6 +167,9 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 - SIGTERM (Docker stop, week 5) is not handled yet; only Ctrl+C/SIGINT shuts down cleanly.
 - Dead-connection detection time depends on websockets keepalive (`ping_interval` / `ping_timeout`, both 20 s by default, so up to ~40 s). Week 2: make them configurable and measure "time to detect a dead charger".
 - One command at a time per charger (ocpp's `call()` lock): a silent charger blocks all commands to it until the call timeout (default 30 s). Is 30 s right for the agent's time budget (week 3/4)?
+- Real firmwares sometimes send out-of-spec transitions. Week 2 may need a "buggy firmware" fault that bypasses the transition table on purpose, and the CSMS must record such transitions without crashing (and maybe flag them). Not built yet.
+- HeartbeatInterval is re-imposed by the CSMS at every boot (BootNotification.conf `interval`, OCPP 1.6 §4.2), so any reboot "fixes" a wrong HeartbeatInterval, as on real chargers. For the week-2 HeartbeatInterval fault: inject it so it survives a reboot (e.g. a firmware that ignores the boot interval), or accept that Reset is a legitimate fix for it?
+- `ManualTime` lives in `tests/` for now. Promote it to `src/` as the simulated clock for week-4 evaluation runs?
 
 ## References (inspiration only)
 

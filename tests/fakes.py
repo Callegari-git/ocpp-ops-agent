@@ -22,8 +22,11 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 from websockets.typing import Subprotocol
 
+from ocpp_ops.clock import Clock
 from ocpp_ops.csms.central_system import CentralSystem
 from ocpp_ops.csms.registry import Registry
+from ocpp_ops.csms.server import start_server
+from ocpp_ops.message_log import MessageLog
 
 OCPP16 = Subprotocol("ocpp1.6")
 HEARTBEAT_INTERVAL = 42
@@ -47,7 +50,7 @@ class FakeClock:
 class RecordingRegistry(Registry):
     """Registry that also remembers every disconnect() call, so tests can wait for one."""
 
-    def __init__(self, now: FakeClock) -> None:
+    def __init__(self, now: Clock) -> None:
         super().__init__(now)
         self.disconnect_calls: list[tuple[str, int]] = []
 
@@ -61,6 +64,7 @@ class CsmsHarness:
     """What the `csms` fixture gives a test: where to connect and what to inspect."""
 
     url: str
+    port: int
     central_system: CentralSystem
     registry: RecordingRegistry
     clock: FakeClock
@@ -173,6 +177,23 @@ class FakeChargePoint(ChargePoint):
 
 
 @asynccontextmanager
+async def running_csms(
+    clock: FakeClock, log_path: Path, port: int = 0
+) -> AsyncIterator[CsmsHarness]:
+    """A real CSMS on 127.0.0.1 (port 0 = any free port), stopped when the block exits."""
+    registry = RecordingRegistry(clock)
+    with MessageLog(log_path) as log:
+        central_system = CentralSystem(
+            registry, log, HEARTBEAT_INTERVAL, now=clock, call_timeout=CALL_TIMEOUT
+        )
+        server = await start_server(central_system, "127.0.0.1", port)
+        async with server:
+            actual_port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{actual_port}"
+            yield CsmsHarness(url, actual_port, central_system, registry, clock, log_path)
+
+
+@asynccontextmanager
 async def fake_charger(base_url: str, charger_id: str = "CP_1") -> AsyncIterator[FakeChargePoint]:
     """Connect a FakeChargePoint to the CSMS and run its receive loop in the background."""
     async with connect(f"{base_url}/{charger_id}", subprotocols=[OCPP16]) as websocket:
@@ -190,12 +211,12 @@ async def fake_charger(base_url: str, charger_id: str = "CP_1") -> AsyncIterator
 WAIT_TIMEOUT_SECONDS = 2.0
 
 
-async def wait_until(condition: Callable[[], bool]) -> None:
+async def wait_until(condition: Callable[[], bool], within: float = WAIT_TIMEOUT_SECONDS) -> None:
     """Poll until condition() is true, for things the server does after the client returns.
 
     Polling (not an asyncio.Event) because the state is changed by server code that has
     no event for tests to await, e.g. the registry update after a connection closes.
     """
-    async with asyncio.timeout(WAIT_TIMEOUT_SECONDS):
+    async with asyncio.timeout(within):
         while not condition():  # noqa: ASYNC110
             await asyncio.sleep(0.01)

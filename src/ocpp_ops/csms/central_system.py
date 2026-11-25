@@ -7,7 +7,6 @@ from ocpp.exceptions import OCPPError
 from ocpp.v16 import call
 from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
 from websockets.exceptions import ConnectionClosed
-from websockets.frames import CloseCode
 
 from ocpp_ops.clock import Clock
 from ocpp_ops.csms.commands import (
@@ -20,9 +19,7 @@ from ocpp_ops.csms.commands import (
 )
 from ocpp_ops.csms.handlers import CsmsChargePoint
 from ocpp_ops.csms.registry import ConfigurationKey, Registry
-from ocpp_ops.message_log import Connection, LoggingConnection, MessageLog
-
-_CLEAN_CLOSE_CODES = {CloseCode.NORMAL_CLOSURE, CloseCode.GOING_AWAY}
+from ocpp_ops.message_log import Connection, LoggingConnection, MessageLog, describe_close
 
 
 class CentralSystem:
@@ -129,21 +126,3 @@ class CentralSystem:
         except OCPPError as error:
             error_code = getattr(error, "code", error.__class__.__name__)
             raise ChargerCallError(charger_id, action, error_code, error.description) from error
-
-
-def describe_close(closed: ConnectionClosed) -> dict[str, Any]:
-    """Why a connection ended, for the DISCONNECTED log line."""
-    if closed.rcvd is None:
-        # No close frame from the charger: the TCP connection just died. RFC 6455 §7.1.5
-        # reports this as code 1006 (abnormal closure).
-        return {
-            "reason": "network_drop",
-            "close_code": CloseCode.ABNORMAL_CLOSURE,
-            "detail": str(closed),
-        }
-    code = closed.rcvd.code
-    return {
-        "reason": "clean" if code in _CLEAN_CLOSE_CODES else "error",
-        "close_code": code,
-        "detail": closed.rcvd.reason or None,
-    }

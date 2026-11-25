@@ -11,6 +11,8 @@ from types import TracebackType
 from typing import Any, Literal, Protocol, Self
 
 from pydantic import BaseModel
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import CloseCode
 
 from ocpp_ops.clock import Clock
 
@@ -18,6 +20,8 @@ Direction = Literal["in", "out"]
 FrameType = Literal["CALL", "CALLRESULT", "CALLERROR", "INVALID"]
 EventType = Literal["CONNECTED", "DISCONNECTED"]
 MessageType = FrameType | EventType
+
+_CLEAN_CLOSE_CODES = {CloseCode.NORMAL_CLOSURE, CloseCode.GOING_AWAY}
 
 # OCPP-J 1.6 §4.1.3: the first element of every frame is its message type id.
 _MESSAGE_TYPE_IDS: dict[int, FrameType] = {2: "CALL", 3: "CALLRESULT", 4: "CALLERROR"}
@@ -209,3 +213,21 @@ class LoggingConnection:
             stale = [message_id for message_id, call in pending.items() if call.sent_at < cutoff]
             for message_id in stale:
                 del pending[message_id]
+
+
+def describe_close(closed: ConnectionClosed) -> dict[str, Any]:
+    """Why a connection ended, for the DISCONNECTED log line: clean, network_drop or error."""
+    if closed.rcvd is None:
+        # No close frame from the charger: the TCP connection just died. RFC 6455 §7.1.5
+        # reports this as code 1006 (abnormal closure).
+        return {
+            "reason": "network_drop",
+            "close_code": CloseCode.ABNORMAL_CLOSURE,
+            "detail": str(closed),
+        }
+    code = closed.rcvd.code
+    return {
+        "reason": "clean" if code in _CLEAN_CLOSE_CODES else "error",
+        "close_code": code,
+        "detail": closed.rcvd.reason or None,
+    }
