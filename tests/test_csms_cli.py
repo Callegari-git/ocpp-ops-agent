@@ -48,7 +48,13 @@ async def test_ctrl_c_closes_server_and_log(tmp_path: Path) -> None:
     remaining_output = (await process.stderr.read()).decode()
     assert process.returncode == 0, remaining_output
     assert "CSMS stopped" in remaining_output
-    actions = [
-        LogRecord.model_validate_json(line).action for line in log_file.read_text().splitlines()
+    records = [LogRecord.model_validate_json(line) for line in log_file.read_text().splitlines()]
+    assert [(r.message_type, r.action) for r in records] == [
+        ("CONNECTED", None),
+        ("CALL", "BootNotification"),
+        ("CALLRESULT", "BootNotification"),
+        ("DISCONNECTED", None),
     ]
-    assert actions == ["BootNotification", "BootNotification"]
+    # The server closed the connection on shutdown with 1001 (going away).
+    assert records[-1].payload["reason"] == "clean"
+    assert records[-1].payload["close_code"] == 1001

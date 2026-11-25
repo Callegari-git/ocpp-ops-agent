@@ -8,7 +8,7 @@ lock is needed.
 import itertools
 from datetime import datetime
 
-from ocpp.v16.enums import ChargePointErrorCode, ChargePointStatus
+from ocpp.v16.enums import ChargePointErrorCode, ChargePointStatus, ConfigurationStatus
 from pydantic import BaseModel, ConfigDict, Field
 
 from ocpp_ops.clock import Clock
@@ -53,6 +53,23 @@ class ConnectorState(_Model):
     last_meter_value: MeterReading | None = None
 
 
+class ConfigurationKey(_Model):
+    """One configuration key as reported by the charger (OCPP 1.6 KeyValue type)."""
+
+    key: str
+    readonly: bool
+    # Optional in OCPP 1.6: a key can exist without a value.
+    value: str | None = None
+
+
+class ConfigChange(_Model):
+    """The charger's answer to our last ChangeConfiguration for one key."""
+
+    value: str
+    status: ConfigurationStatus
+    at: datetime
+
+
 class ChargerState(_Model):
     """Everything the CSMS knows about one charger."""
 
@@ -62,7 +79,11 @@ class ChargerState(_Model):
     connected: bool = False
     boot_time: datetime | None = None
     last_heartbeat: datetime | None = None
-    known_config: dict[str, str] = Field(default_factory=dict)
+    # What the charger itself reported via GetConfiguration, by key.
+    known_config: dict[str, ConfigurationKey] = Field(default_factory=dict)
+    # Last ChangeConfiguration answer per key. It does NOT update known_config, even when
+    # Accepted: only a new GetConfiguration tells us what the charger really holds.
+    config_changes: dict[str, ConfigChange] = Field(default_factory=dict)
     # OCPP 1.6 §4.9: connectorId 0 is the charge point as a whole; 1..N are the connectors.
     connectors: dict[int, ConnectorState] = Field(default_factory=dict)
 
@@ -126,6 +147,22 @@ class Registry:
 
     def record_meter_value(self, charger_id: str, connector_id: int, reading: MeterReading) -> None:
         self._connector(charger_id, connector_id).last_meter_value = reading
+
+    def record_configuration(
+        self, charger_id: str, keys: list[ConfigurationKey], unknown_keys: list[str]
+    ) -> None:
+        """Merge a GetConfiguration answer: update reported keys, forget unknown ones."""
+        known_config = self._chargers[charger_id].known_config
+        for item in keys:
+            known_config[item.key] = item
+        for key in unknown_keys:
+            known_config.pop(key, None)
+
+    def record_config_change(
+        self, charger_id: str, key: str, value: str, status: ConfigurationStatus
+    ) -> None:
+        change = ConfigChange(value=value, status=status, at=self._now())
+        self._chargers[charger_id].config_changes[key] = change
 
     def get(self, charger_id: str) -> ChargerState | None:
         return self._chargers.get(charger_id)

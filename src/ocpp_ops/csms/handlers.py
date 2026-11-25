@@ -31,8 +31,9 @@ class CsmsChargePoint(ChargePoint):
         registry: Registry,
         heartbeat_interval: int,
         now: Clock,
+        response_timeout: float,
     ) -> None:
-        super().__init__(charger_id, connection)
+        super().__init__(charger_id, connection, response_timeout=response_timeout)
         self._registry = registry
         self._heartbeat_interval = heartbeat_interval
         self._now = now

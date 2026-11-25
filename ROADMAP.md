@@ -33,7 +33,7 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 - [x] Handlers: BootNotification, Heartbeat, StatusNotification, MeterValues
 - [x] In-memory charger registry: status per connector, last heartbeat, known config
-- [ ] Outbound commands: GetConfiguration, ChangeConfiguration, Reset (future agent tools)
+- [x] Outbound commands: GetConfiguration, ChangeConfiguration, Reset (future agent tools)
 - [x] JSONL logging of every message in and out
 
 ### Virtual charger
@@ -142,14 +142,21 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 | 2026-11-24 | Each connection gets a registry token; a close only marks the charger disconnected if its token is still the current one | A charger can reconnect before its old connection is detected as dead; the old one closing must not mark the live one offline |
 | 2026-11-24 | Connector state keeps both the charger's `timestamp` and our `received_at` | Makes the week-2 clock-drift fault observable |
 | 2026-11-24 | Unparseable frames are logged as `INVALID` with the raw text, not dropped | The audit trail must contain everything that crossed the wire |
+| 2026-11-24 | `CentralSystem` class owns live sessions and outbound commands (`get_configuration`, `change_configuration`, `reset`); typed results, `CommandError` subclasses for not connected / timeout / CALLERROR | One object for the future agent tools to call; `call(suppress=False)` because ocpp otherwise returns `None` on a CALLERROR |
+| 2026-11-24 | CSMS commands are mechanism only, no safety logic | Guardrails live in the agent layer (week 3), so the rule-based baseline and the agent use the same raw tools |
+| 2026-11-24 | ChangeConfiguration records the charger's answer in `config_changes` but never updates `known_config`, even when Accepted | `known_config` is only what the charger reported via GetConfiguration; the week-3 verify step must re-read, not trust our assumption |
+| 2026-11-24 | `known_config` stores value **and** readonly per key | The agent must know a key is read-only before trying to change it |
+| 2026-11-24 | CONNECTED / DISCONNECTED events in the same JSONL file, same line shape (`direction`/`message_id`/`action` null); disconnect reason `clean` / `network_drop` (code 1006) / `error` | One format for readers; the agent needs connection history for the reconnect-loop fault |
+| 2026-11-24 | Pending CALL ids in the log wrapper expire after 2 × call timeout | Unanswered CALLs would otherwise accumulate for the life of the connection; 2× (not 1×) so a late answer is still logged with its action |
 
 ## Open questions
 
 - Simulated clock vs real time for heartbeats and timeouts? (Real time is simpler; a simulated clock makes the evaluation much faster.)
 - Which LLM(s) to evaluate in week 4, and with what budget per incident?
 - Messages before an accepted BootNotification: the CSMS currently accepts them. Should it reject them (OCPP 1.6 §4.2)? Decide in week 2 together with the Pending/Rejected boot faults.
-- Connect/disconnect events are not in the JSONL log (only OCPP frames are). The agent will need them for the week-2 reconnect-loop fault: add them as their own record type?
 - SIGTERM (Docker stop, week 5) is not handled yet; only Ctrl+C/SIGINT shuts down cleanly.
+- Dead-connection detection time depends on websockets keepalive (`ping_interval` / `ping_timeout`, both 20 s by default, so up to ~40 s). Week 2: make them configurable and measure "time to detect a dead charger".
+- One command at a time per charger (ocpp's `call()` lock): a silent charger blocks all commands to it until the call timeout (default 30 s). Is 30 s right for the agent's time budget (week 3/4)?
 
 ## References (inspiration only)
 

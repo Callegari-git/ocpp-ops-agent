@@ -1,11 +1,11 @@
-"""JSONL log of every OCPP frame, in and out.
+"""JSONL log of every OCPP frame in and out, plus connection events.
 
-One JSON line per frame. This file is the audit trail, and later the agent's context.
+One JSON line per frame or event. This file is the audit trail, and later the agent's context.
 """
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self
@@ -15,17 +15,19 @@ from pydantic import BaseModel
 from ocpp_ops.clock import Clock
 
 Direction = Literal["in", "out"]
-MessageType = Literal["CALL", "CALLRESULT", "CALLERROR", "INVALID"]
+FrameType = Literal["CALL", "CALLRESULT", "CALLERROR", "INVALID"]
+EventType = Literal["CONNECTED", "DISCONNECTED"]
+MessageType = FrameType | EventType
 
 # OCPP-J 1.6 §4.1.3: the first element of every frame is its message type id.
-_MESSAGE_TYPE_IDS: dict[int, MessageType] = {2: "CALL", 3: "CALLRESULT", 4: "CALLERROR"}
+_MESSAGE_TYPE_IDS: dict[int, FrameType] = {2: "CALL", 3: "CALLRESULT", 4: "CALLERROR"}
 
 
 @dataclass(frozen=True)
 class Frame:
     """The parts of one OCPP-J frame that we log."""
 
-    message_type: MessageType
+    message_type: FrameType
     message_id: str | None
     action: str | None  # only CALL frames carry their action
     payload: Any
@@ -54,11 +56,15 @@ def parse_frame(raw: str | bytes) -> Frame:
 
 
 class LogRecord(BaseModel):
-    """One line of the JSONL log."""
+    """One line of the JSONL log.
+
+    Frames and connection events share this shape so readers parse a single format.
+    For CONNECTED/DISCONNECTED lines, direction, message_id and action are null.
+    """
 
     timestamp: datetime
     charger_id: str
-    direction: Direction
+    direction: Direction | None
     message_type: MessageType
     message_id: str | None
     action: str | None
@@ -105,6 +111,12 @@ class Connection(Protocol):
     async def send(self, message: str) -> None: ...
 
 
+@dataclass(frozen=True)
+class _PendingCall:
+    action: str
+    sent_at: datetime
+
+
 class LoggingConnection:
     """Wraps a websocket connection so every frame is logged on its way in or out.
 
@@ -112,15 +124,26 @@ class LoggingConnection:
     this wrapper logs every frame without touching the library's internals.
     """
 
-    def __init__(self, connection: Connection, charger_id: str, log: MessageLog, now: Clock):
+    def __init__(
+        self,
+        connection: Connection,
+        charger_id: str,
+        log: MessageLog,
+        now: Clock,
+        pending_ttl: timedelta,
+    ) -> None:
         self._connection = connection
         self._charger_id = charger_id
         self._log = log
         self._now = now
-        # message_id -> action for CALLs still waiting for their response. One map per
-        # direction: each side picks its own ids, so the two could collide.
-        self._calls_sent: dict[str, str] = {}
-        self._calls_received: dict[str, str] = {}
+        # message_id -> CALL still waiting for its response, so the response can be logged
+        # with the CALL's action. One map per direction: each side picks its own ids, so
+        # the two could collide.
+        self._calls_sent: dict[str, _PendingCall] = {}
+        self._calls_received: dict[str, _PendingCall] = {}
+        # A CALL that is never answered (timeout) would otherwise stay in its map for as
+        # long as the connection lives. Its entry is dropped after this long.
+        self._pending_ttl = pending_ttl
 
     async def recv(self) -> str | bytes:
         raw = await self._connection.recv()
@@ -132,6 +155,25 @@ class LoggingConnection:
         # returns, and it needs our CALL to be known already to find its action.
         self._record("out", message)
         await self._connection.send(message)
+
+    def record_event(self, event: EventType, payload: dict[str, Any]) -> None:
+        """Log a connection event (not an OCPP frame) for this charger."""
+        self._log.write(
+            LogRecord(
+                timestamp=self._now(),
+                charger_id=self._charger_id,
+                direction=None,
+                message_type=event,
+                message_id=None,
+                action=None,
+                payload=payload,
+            )
+        )
+
+    @property
+    def pending_count(self) -> int:
+        """CALLs (both directions) still remembered while waiting for their response."""
+        return len(self._calls_sent) + len(self._calls_received)
 
     def _record(self, direction: Direction, raw: str | bytes) -> None:
         frame = parse_frame(raw)
@@ -148,12 +190,22 @@ class LoggingConnection:
 
     def _action_for(self, direction: Direction, frame: Frame) -> str | None:
         """A CALL names its action; a response only carries the id of the CALL it answers."""
-        if frame.message_type == "CALL" and frame.message_id is not None:
+        if frame.message_id is None or frame.message_type == "INVALID":
+            return None
+        if frame.message_type == "CALL":
+            self._forget_stale_calls()
             pending = self._calls_sent if direction == "out" else self._calls_received
-            pending[frame.message_id] = frame.action
+            if frame.action is not None:
+                pending[frame.message_id] = _PendingCall(frame.action, self._now())
             return frame.action
-        if frame.message_type in ("CALLRESULT", "CALLERROR") and frame.message_id is not None:
-            # A response going out answers a CALL that came in, and vice versa.
-            pending = self._calls_received if direction == "out" else self._calls_sent
-            return pending.pop(frame.message_id, None)
-        return None
+        # A response going out answers a CALL that came in, and vice versa.
+        pending = self._calls_received if direction == "out" else self._calls_sent
+        call = pending.pop(frame.message_id, None)
+        return call.action if call else None
+
+    def _forget_stale_calls(self) -> None:
+        cutoff = self._now() - self._pending_ttl
+        for pending in (self._calls_sent, self._calls_received):
+            stale = [message_id for message_id, call in pending.items() if call.sent_at < cutoff]
+            for message_id in stale:
+                del pending[message_id]

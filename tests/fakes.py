@@ -6,18 +6,29 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
+from ocpp.routing import on
 from ocpp.v16 import ChargePoint, call, call_result
 from ocpp.v16.datatypes import MeterValue
-from ocpp.v16.enums import ChargePointErrorCode, ChargePointStatus
+from ocpp.v16.enums import (
+    Action,
+    ChargePointErrorCode,
+    ChargePointStatus,
+    ConfigurationStatus,
+    ResetStatus,
+)
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 from websockets.typing import Subprotocol
 
+from ocpp_ops.csms.central_system import CentralSystem
 from ocpp_ops.csms.registry import Registry
 
 OCPP16 = Subprotocol("ocpp1.6")
 HEARTBEAT_INTERVAL = 42
+# Short, so the timeout test is quick; a localhost round trip takes milliseconds.
+CALL_TIMEOUT = 0.5
 
 
 class FakeClock:
@@ -50,17 +61,84 @@ class CsmsHarness:
     """What the `csms` fixture gives a test: where to connect and what to inspect."""
 
     url: str
+    central_system: CentralSystem
     registry: RecordingRegistry
     clock: FakeClock
     log_path: Path
 
 
+AnswerMode = Literal["answer", "silent", "error"]
+
+
 class FakeChargePoint(ChargePoint):
-    """Minimal OCPP 1.6 charger that sends requests when the test asks."""
+    """Minimal OCPP 1.6 charger: sends requests when the test asks, answers CSMS commands.
+
+    `mode` controls how it answers commands: normally, never ("silent", for timeouts), or
+    with a CALLERROR ("error").
+    """
 
     def __init__(self, charger_id: str, websocket: ClientConnection) -> None:
         super().__init__(charger_id, websocket)
         self.websocket = websocket
+        self.mode: AnswerMode = "answer"
+        self.config = {
+            "HeartbeatInterval": "60",
+            "NumberOfConnectors": "2",
+            "WebSocketPingInterval": "0",
+        }
+        self.readonly_keys = {"NumberOfConnectors"}
+        self.reboot_required_keys = {"WebSocketPingInterval"}
+        self.resets: list[str] = []
+
+    # --- Commands from the CSMS ---
+
+    @on(Action.get_configuration)
+    async def on_get_configuration(
+        self, key: list[str] | None = None
+    ) -> call_result.GetConfiguration:
+        await self._before_answer()
+        # OCPP 1.6 §5.8: no key list (or an empty one) means "all keys".
+        wanted = key or list(self.config)
+        known = [k for k in wanted if k in self.config]
+        unknown = [k for k in wanted if k not in self.config]
+        return call_result.GetConfiguration(
+            configuration_key=[
+                {"key": k, "readonly": k in self.readonly_keys, "value": self.config[k]}
+                for k in known
+            ],
+            unknown_key=unknown or None,
+        )
+
+    @on(Action.change_configuration)
+    async def on_change_configuration(
+        self, key: str, value: str
+    ) -> call_result.ChangeConfiguration:
+        await self._before_answer()
+        if key not in self.config:
+            status = ConfigurationStatus.not_supported
+        elif key in self.readonly_keys:
+            status = ConfigurationStatus.rejected
+        elif key in self.reboot_required_keys:
+            status = ConfigurationStatus.reboot_required
+        else:
+            status = ConfigurationStatus.accepted
+            self.config[key] = value
+        return call_result.ChangeConfiguration(status=status)
+
+    @on(Action.reset)
+    async def on_reset(self, type: str) -> call_result.Reset:
+        await self._before_answer()
+        self.resets.append(type)
+        return call_result.Reset(status=ResetStatus.accepted)
+
+    async def _before_answer(self) -> None:
+        if self.mode == "silent":
+            await asyncio.Event().wait()  # never answers; cancelled when the test ends
+        if self.mode == "error":
+            # ocpp turns an exception in a handler into a CALLERROR (InternalError).
+            raise RuntimeError("simulated charger failure")
+
+    # --- Requests to the CSMS ---
 
     async def boot(self) -> call_result.BootNotification:
         return await self.call(
