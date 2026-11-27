@@ -23,6 +23,7 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake
 from websockets.frames import CloseCode
 from websockets.typing import Subprotocol
 
+from ocpp_ops.cancellation import is_cancelling
 from ocpp_ops.charger.config import ConfigStore
 from ocpp_ops.charger.protocol import ChargerChargePoint
 from ocpp_ops.charger.state_machine import ConnectorState, check_transition
@@ -253,11 +254,20 @@ class VirtualCharger:
         self._restart_heartbeat()
 
     def _restart_heartbeat(self) -> None:
-        """(Re)start the heartbeat loop with the current HeartbeatInterval; 0 means none."""
+        """(Re)start the heartbeat loop with the current HeartbeatInterval; 0 means none.
+
+        The only place that adds a task to a running session. Called from session tasks
+        (the boot sequence, the ChangeConfiguration handler).
+        """
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
         if not self._booted or self._session_tasks is None or self._charge_point is None:
+            return
+        if is_cancelling():
+            # The session is ending: when its TaskGroup shuts down it cancels every session
+            # task, this caller included, and refuses new ones (RuntimeError). Checked before
+            # the coroutine is created, so none is left un-awaited.
             return
         if self.config.heartbeat_interval > 0:
             self._heartbeat_task = self._session_tasks.create_task(

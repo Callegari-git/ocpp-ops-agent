@@ -1,5 +1,9 @@
 """Outbound commands (CSMS -> charger) against a fake charger over a real WebSocket."""
 
+import asyncio
+from contextlib import suppress
+from typing import Any
+
 import pytest
 from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
 
@@ -9,6 +13,7 @@ from ocpp_ops.csms.commands import (
     ChargerNotConnectedError,
     CommandTimeoutError,
 )
+from ocpp_ops.csms.handlers import CsmsChargePoint
 from ocpp_ops.csms.registry import ChargerState, ConfigurationKey
 
 
@@ -167,3 +172,29 @@ async def test_commands_go_to_the_newest_connection(csms: CsmsHarness) -> None:
         await wait_until(lambda: len(csms.registry.disconnect_calls) == 1)
         await csms.central_system.reset("CP_1", ResetType.hard)
         assert new.resets == ["Soft", "Hard"]
+
+
+async def test_command_cancelled_as_the_answer_arrives_raises_cancelled(
+    csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Python 3.11, ocpp's call() can return the answer of a cancelled command
+    (CPython gh-86296). Recreated here on every version: the command must still raise."""
+    original_call = CsmsChargePoint.call
+
+    async def call_like_python_311(
+        self: CsmsChargePoint, payload: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        response = await original_call(self, payload, *args, **kwargs)
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()  # cancelled just as the answer arrives...
+        with suppress(asyncio.CancelledError):
+            await asyncio.sleep(0)  # ...and the cancellation swallowed, as 3.11's wait_for does
+        return response
+
+    async with fake_charger(csms.url) as cp:
+        await cp.boot()
+        monkeypatch.setattr(CsmsChargePoint, "call", call_like_python_311)
+        command = asyncio.create_task(csms.central_system.get_configuration("CP_1"))
+        with pytest.raises(asyncio.CancelledError):
+            await command

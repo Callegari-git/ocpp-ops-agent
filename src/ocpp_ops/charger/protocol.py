@@ -12,6 +12,7 @@ from ocpp.routing import after, on
 from ocpp.v16 import ChargePoint, call_result
 from ocpp.v16.enums import Action, ResetStatus, ResetType
 
+from ocpp_ops.cancellation import raise_if_cancelling
 from ocpp_ops.message_log import Connection
 
 if TYPE_CHECKING:  # only for type hints; avoids a circular import at runtime
@@ -36,7 +37,11 @@ class ChargerChargePoint(ChargePoint):
         Message ids come from the charger's seeded RNG instead of ocpp's default uuid4(),
         so the same seed gives the same ids. suppress=False: a CALLERROR raises.
         """
-        return await self.call(request, unique_id=self._new_message_id(), suppress=False)
+        response = await self.call(request, unique_id=self._new_message_id(), suppress=False)
+        # On Python 3.11 call() can swallow a cancellation (see raise_if_cancelling): without
+        # this, a stopped session would carry on booting or heartbeating.
+        raise_if_cancelling()
+        return response
 
     @on(Action.get_configuration)
     def on_get_configuration(self, key: list[str] | None = None) -> call_result.GetConfiguration:

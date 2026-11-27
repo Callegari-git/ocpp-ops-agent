@@ -8,6 +8,7 @@ from ocpp.v16 import call
 from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
 from websockets.exceptions import ConnectionClosed
 
+from ocpp_ops.cancellation import raise_if_cancelling
 from ocpp_ops.clock import Clock
 from ocpp_ops.csms.commands import (
     ChangeConfigurationResult,
@@ -118,7 +119,7 @@ class CentralSystem:
         action = request.__class__.__name__
         try:
             # suppress=False: by default ocpp returns None on a CALLERROR; we want an error.
-            return await charge_point.call(request, suppress=False)
+            response = await charge_point.call(request, suppress=False)
         except TimeoutError as error:
             raise CommandTimeoutError(charger_id, action, self._call_timeout) from error
         except ConnectionClosed as error:
@@ -126,3 +127,7 @@ class CentralSystem:
         except OCPPError as error:
             error_code = getattr(error, "code", error.__class__.__name__)
             raise ChargerCallError(charger_id, action, error_code, error.description) from error
+        # A cancelled command must not return a result, even on Python 3.11 where call() can
+        # swallow the cancellation (see raise_if_cancelling).
+        raise_if_cancelling()
+        return response

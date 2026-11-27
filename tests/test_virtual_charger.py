@@ -1,6 +1,9 @@
 """Virtual charger against a real CSMS, under virtual time (ManualTime): fast and exact."""
 
 import asyncio
+import gc
+import warnings
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,7 +11,7 @@ from typing import Any
 
 import pytest
 from ocpp.routing import on
-from ocpp.v16 import ChargePoint, call_result
+from ocpp.v16 import ChargePoint, call, call_result
 from ocpp.v16.enums import Action, ConfigurationStatus, RegistrationStatus, ResetStatus, ResetType
 from ocpp.v16.enums import ChargePointErrorCode as E
 from ocpp.v16.enums import ChargePointStatus as S
@@ -18,6 +21,7 @@ from websockets.exceptions import ConnectionClosed
 from fakes import HEARTBEAT_INTERVAL, OCPP16, CsmsHarness, running_csms, wait_until
 from manual_time import ManualTime
 from ocpp_ops.charger.charger import VirtualCharger
+from ocpp_ops.charger.protocol import ChargerChargePoint
 from ocpp_ops.charger.state_machine import InvalidTransitionError
 from ocpp_ops.csms.registry import ChargerState, ConfigurationKey
 from ocpp_ops.message_log import LogRecord, MessageLog
@@ -428,3 +432,111 @@ async def test_same_seed_same_run(tmp_path: Path) -> None:
     # A different seed changes the message ids and the reconnect jitter.
     assert [r[3] for r in log_a] != [r[3] for r in log_c]
     assert sleeps_a != sleeps_c
+
+
+# --- Cancellation swallowed by the ocpp library (Python 3.11) ----------------------------
+#
+# ocpp's ChargePoint.call() waits for the answer with asyncio.wait_for(). On Python 3.11,
+# wait_for returns the answer instead of raising CancelledError when the answer and the
+# cancellation arrive in the same loop iteration (CPython gh-86296, fixed in 3.12). The
+# tests below recreate that on every Python version, so the fix is checked everywhere.
+
+
+def _swallow_cancellation_on(
+    monkeypatch: pytest.MonkeyPatch,
+    run_task: Callable[[], asyncio.Task[None]],
+    is_target: Callable[[Any], bool],
+    then: Callable[[], None] = lambda: None,
+) -> None:
+    """Patch ocpp's call(): on the first `is_target` request, get the real answer, stop the
+    charger (cancel its run() task), swallow the cancellation as 3.11's wait_for does, call
+    `then()`, and return the answer anyway."""
+    original_call = ChargerChargePoint.call
+    fired = False
+
+    async def call_like_python_311(
+        self: ChargerChargePoint, payload: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        nonlocal fired
+        response = await original_call(self, payload, *args, **kwargs)
+        if fired or not is_target(payload):
+            return response
+        fired = True
+        run_task().cancel()
+        # Let the session's TaskGroup abort and cancel this task, then swallow it.
+        for _ in range(5):
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0)
+        then()
+        return response
+
+    monkeypatch.setattr(ChargerChargePoint, "call", call_like_python_311)
+
+
+async def _stop_and_collect_warnings(task: asyncio.Task[None]) -> list[str]:
+    """Wait for the stopped run() task; return any "never awaited" warnings."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(asyncio.CancelledError):  # a clean stop, not a RuntimeError
+            async with asyncio.timeout(5):
+                await task
+        gc.collect()  # "never awaited" is reported when the coroutine is collected
+    return [str(w.message) for w in caught if "never awaited" in str(w.message)]
+
+
+async def _assert_closed_cleanly(csms: CsmsHarness) -> None:
+    await wait_until(lambda: not _state(csms).connected)
+    disconnected = [r for r in _read_log(csms.log_path) if r.message_type == "DISCONNECTED"]
+    assert disconnected[-1].payload["close_code"] == 1001
+
+
+async def test_stop_while_the_last_boot_answer_arrives(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CI failure on 3.11: the fleet is stopped just as the answer to the last
+    StatusNotification of the boot arrives. The session must end cleanly, without starting
+    the heartbeat in a TaskGroup that is shutting down."""
+    charger = make_charger(sim_csms.url, time, connectors=CONNECTORS)
+    task: asyncio.Task[None] | None = None
+
+    def is_last_status(payload: Any) -> bool:
+        return isinstance(payload, call.StatusNotification) and payload.connector_id == CONNECTORS
+
+    _swallow_cancellation_on(monkeypatch, lambda: task, is_last_status)  # type: ignore[arg-type,return-value]
+    task = asyncio.create_task(charger.run())
+
+    assert await _stop_and_collect_warnings(task) == []
+    assert time.requested == []  # the heartbeat loop never started
+    await _assert_closed_cleanly(sim_csms)
+
+
+async def test_heartbeat_interval_change_while_the_session_is_ending(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A HeartbeatInterval change reaching a session that is ending is stored, but starts no
+    heartbeat task. Today the ChangeConfiguration handler is synchronous and can't run in a
+    cancelled task, so the change is made from the heartbeat task, whose call() can swallow
+    the cancellation."""
+    charger = make_charger(sim_csms.url, time, connectors=CONNECTORS)
+    task: asyncio.Task[None] | None = None
+    statuses: list[ConfigurationStatus] = []
+
+    def change_interval() -> None:
+        statuses.append(charger.change_configuration("HeartbeatInterval", "10"))
+
+    _swallow_cancellation_on(
+        monkeypatch,
+        lambda: task,  # type: ignore[arg-type,return-value]
+        lambda payload: isinstance(payload, call.Heartbeat),
+        then=change_interval,
+    )
+    task = asyncio.create_task(charger.run())
+    await wait_until(lambda: _is_booted(sim_csms))
+    await _wait_idle(time, charger, booted=True)
+    time.advance_to_next()  # first heartbeat: the session is stopped as its answer arrives
+
+    assert await _stop_and_collect_warnings(task) == []
+    assert statuses == [ConfigurationStatus.accepted]
+    assert charger.config.heartbeat_interval == 10
+    assert time.requested == [HEARTBEAT_INTERVAL]  # no new heartbeat loop asked to sleep
+    await _assert_closed_cleanly(sim_csms)
