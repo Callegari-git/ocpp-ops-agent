@@ -17,12 +17,8 @@ from ocpp_ops.csms.registry import Registry
 from ocpp_ops.csms.server import start_server
 from ocpp_ops.fleet.config import Fleet, FleetFileError, load_fleet
 from ocpp_ops.fleet.launcher import FleetMember, build_fleet, run_fleet
-from ocpp_ops.fleet.status_table import (
-    ChargerRow,
-    rows_from_chargers,
-    rows_from_registry,
-    show_status,
-)
+from ocpp_ops.fleet.status_grid import show_status
+from ocpp_ops.fleet.status_rows import ChargerRow, rows_from_chargers, rows_from_registry
 from ocpp_ops.message_log import MessageLog
 
 logger = logging.getLogger("ocpp_ops.fleet")
@@ -62,9 +58,12 @@ async def run_embedded(fleet: Fleet, port: int, log_dir: Path) -> None:
             url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
             logger.info("Embedded CSMS listening on %s (log: %s)", url, log.path)
             members = build_fleet(fleet, url, now=utc_now, sleep=asyncio.sleep)
-            charger_ids = [member.charger.id for member in members]
+            specs = fleet.chargers()
             await _run_with_status(
-                members, lambda: rows_from_registry(charger_ids, central_system.registry)
+                members,
+                lambda: rows_from_registry(
+                    specs, central_system.registry, fleet.heartbeat_interval
+                ),
             )
 
 
@@ -89,8 +88,8 @@ async def _run_with_status(
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    # A redrawn table and log lines on the same terminal would garble each other: with the
-    # table on screen, only warnings are logged.
+    # A redrawn grid and log lines on the same terminal would garble each other: with the
+    # grid on screen, only warnings are logged.
     level = logging.WARNING if sys.stdout.isatty() else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # The ocpp library logs every frame at INFO; the JSONL log already records them.
@@ -109,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(run_embedded(fleet, args.port, args.log_dir))
     except KeyboardInterrupt:
         # Cleanup already happened inside run_*(); see run_embedded's docstring. Printed,
-        # not logged: with the table on, INFO logging is off.
+        # not logged: with the grid on, INFO logging is off.
         print("Fleet stopped", file=sys.stderr)
 
 

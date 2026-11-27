@@ -48,7 +48,7 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 - [x] `fleet.yaml` format (charger templates: vendor, model, connectors, count, id prefix; no heartbeat interval, the CSMS sets it at boot)
 - [x] Launcher: N chargers in one asyncio process, seeded start-up jitter; embedded CSMS by default, `--csms-url` for an external one
-- [x] Live terminal status table
+- [x] Live terminal status view (compact grid + Attention list, fits 100×30)
 
 ### Tests
 
@@ -100,7 +100,7 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 
 **Done when:** one results table with resolution rate, blocked actions, cost and time, for both approaches, on the same scenarios.
 
-- [ ] Rule-based baseline script (same tools, same scenarios)
+- [ ] Rule-based baseline script (same tools, same scenarios). Detection half: reuse `fleet.status_rows.attention()` as is
 - [ ] Harness: same scenarios, same seeds, same budget for both
 - [ ] Metrics collection + results table
 - [ ] Manual review of a sample of agent runs
@@ -162,9 +162,14 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 | 2026-11-27 | Fleet file: templates (id prefix, vendor, model, connectors, count) + global seed, CSMS heartbeat interval, start-up jitter window; Pydantic with `extra="forbid"`; uniqueness checked on the generated ids | Typos must fail loudly; different prefixes can still produce the same id (`CP-` ×1001 vs `CP-1`). No per-template heartbeat interval: the CSMS sets it at boot |
 | 2026-11-27 | One RNG per charger, seeded with `sha256(f"{fleet_seed}/{charger_id}")` (first 8 bytes); its first draw is the start-up delay, `uniform(0, window)` | A shared RNG would make every charger's behavior depend on the others; sha256 is stable across processes and Python versions, unlike `hash()` |
 | 2026-11-27 | Embedded mode logs the CSMS side only (`logs/csms-*.jsonl`); `--csms-url` mode logs the charger side (`logs/fleet-*.jsonl`) | Every message is logged once in each mode, without writing every frame twice |
-| 2026-11-27 | Live table in plain text + ANSI codes (alternate screen, redraw in place), no library; summary line only when stdout is not a TTY; INFO logging off while the table is on | No new dependency; pipes and CI get readable lines; log lines would garble the redraw |
+| 2026-11-27 | Live view in plain text + ANSI codes (alternate screen, redraw in place), no library; summary line only when stdout is not a TTY; INFO logging off while it is on | No new dependency; pipes and CI get readable lines; log lines would garble the redraw |
 | 2026-11-27 | Fleet tasks stop before the embedded CSMS on Ctrl+C | Each charger closes with 1001 while the server is still up, so the CSMS log shows clean stops |
 | 2026-11-27 | Scale test measured with jitter 0 and marked `slow` (skippable locally with `-m "not slow"`, run in CI) | Jitter 0 is the worst case for the CSMS; with the default 10 s window the time would only measure the jitter |
+| 2026-11-27 | Compact grid instead of one row per charger: summary + legend, one cell per charger (id + one dot per connector 1..N), Attention list (max 5, then "… N more"). Width read at every refresh | 50 rows don't fit a terminal, and this view is the README hero GIF. At 100 columns the 50-charger fleet takes ~18 lines |
+| 2026-11-27 | Dot colors: green Available, blue Preparing…Finishing, yellow Unavailable, red Faulted, gray offline / not booted / never reported. The id is colored by connector 0 (red Faulted, yellow Unavailable, gray offline), default color when Available | A grid of green ids would be unreadable; connector 0 is the charge point as a whole (OCPP 1.6 §4.9), so it belongs on the id |
+| 2026-11-27 | Colors off when `NO_COLOR` is set (no-color.org) or stdout is not a TTY; without colors, connectors are letters (A/B/U/F/-) | Identical dots would carry no information without color |
+| 2026-11-27 | Attention severity: offline > Faulted > connected-not-booted > late heartbeat (more than 2 × interval since the last heartbeat, or since boot if none since); one line per charger with every reason, sorted by its worst. Offline or not-booted chargers get no other reason, since their last statuses may be stale | Blind (offline) is worse than a known fault; the boot fallback catches a charger that never heartbeats; the "latest of heartbeat and boot" rule avoids flagging a just-rebooted charger |
+| 2026-11-27 | `attention()` (in `fleet/status_rows.py`) is pure and free of any display concern; rendering lives in `fleet/status_grid.py` | It is effectively the **detection half of the week-4 rule-based baseline** and must be reusable there as is |
 
 ## Open questions
 
@@ -176,8 +181,8 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 - One command at a time per charger (ocpp's `call()` lock): a silent charger blocks all commands to it until the call timeout (default 30 s). Is 30 s right for the agent's time budget (week 3/4)?
 - Real firmwares sometimes send out-of-spec transitions. Week 2 may need a "buggy firmware" fault that bypasses the transition table on purpose, and the CSMS must record such transitions without crashing (and maybe flag them). Not built yet.
 - `ManualTime` lives in `tests/` for now. Promote it to `src/` as the simulated clock for week-4 evaluation runs?
-- The registry stores `boot_time` but not the boot status: the table shows `Accepted` because our CSMS accepts every boot. Week 2 (Pending/Rejected faults) needs a real `boot_status` field.
-- The 50-row table is taller than many terminals; the header scrolls off (the summary line stays visible at the bottom). Fine for the demo; compact or paged view if it bothers us.
+- The registry stores `boot_time` but not the boot status: the status view infers "booted" from `boot_time` because our CSMS accepts every boot. Week 2 (Pending/Rejected faults) needs a real `boot_status` field.
+- `attention()` does not flag a connector (or connector 0) left Unavailable: it only shows as a yellow dot/id. The week-2 "set Unavailable and never set back" fault needs a rule for it (Unavailable for longer than X?) in the week-4 baseline.
 
 ## References (inspiration only)
 

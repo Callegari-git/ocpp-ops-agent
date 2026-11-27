@@ -96,6 +96,8 @@ class VirtualCharger:
         # When the CSMS last answered one of our Heartbeats, by our clock. Kept across
         # sessions: it is "last seen" from the charger's side.
         self._last_heartbeat: datetime | None = None
+        # When the last BootNotification was Accepted, by our clock.
+        self._boot_time: datetime | None = None
 
     # --- State, read-only from outside ---
 
@@ -118,6 +120,10 @@ class VirtualCharger:
     @property
     def last_heartbeat(self) -> datetime | None:
         return self._last_heartbeat
+
+    @property
+    def boot_time(self) -> datetime | None:
+        return self._boot_time
 
     # --- The single path for status changes ---
 
@@ -241,6 +247,7 @@ class VirtualCharger:
             # OCPP 1.6 §4.2: on Accepted, `interval` is the heartbeat interval to use.
             self.config.set_heartbeat_interval(response.interval)
         self._booted = True
+        self._boot_time = self._now()
         for connector_id in self._connectors:  # connector 0 first, then 1..N
             await self._send_status(charge_point, connector_id)
         self._restart_heartbeat()

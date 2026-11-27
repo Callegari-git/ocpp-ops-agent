@@ -90,14 +90,16 @@ async def test_heartbeats_at_the_interval_from_boot(
 async def test_charger_side_view_for_the_status_table(
     time: ManualTime, sim_csms: CsmsHarness
 ) -> None:
-    """connected / booted / last_heartbeat: what the fleet table shows with an external CSMS."""
+    """What the fleet grid shows with an external CSMS: the charger-side view."""
     charger = make_charger(sim_csms.url, time, connectors=CONNECTORS)
     assert charger.connector_ids == [0, 1, 2]
     assert (charger.connected, charger.booted, charger.last_heartbeat) == (False, False, None)
+    assert charger.boot_time is None
     async with running(charger):
         await wait_until(lambda: _is_booted(sim_csms))
         await _wait_idle(time, charger, booted=True)
         assert (charger.connected, charger.booted, charger.last_heartbeat) == (True, True, None)
+        assert charger.boot_time == time()
         time.advance_to_next()
         await _wait_idle(time, charger, booted=True)
         # Set when the CSMS answered, by the charger's clock.
