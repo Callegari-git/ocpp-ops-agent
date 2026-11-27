@@ -7,7 +7,7 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 - **Budget:** 5 weeks, ~15–20 h/week (80–100 h total)
 - **Target:** public v1 (repo + demo video + results + article) before end of January 2027
 - **Started:** 2026-11-24
-- **Last updated:** 2026-11-24
+- **Last updated:** 2026-11-27
 
 ## Success metrics (to publish)
 
@@ -46,15 +46,15 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 ### Fleet
 
-- [ ] `fleet.yaml` format (charger templates: vendor, model, connectors, heartbeat interval; count per template)
-- [ ] Launcher: N chargers in one asyncio process, seeded start-up jitter
-- [ ] Live terminal status table
+- [x] `fleet.yaml` format (charger templates: vendor, model, connectors, count, id prefix; no heartbeat interval, the CSMS sets it at boot)
+- [x] Launcher: N chargers in one asyncio process, seeded start-up jitter; embedded CSMS by default, `--csms-url` for an external one
+- [x] Live terminal status table
 
 ### Tests
 
-- [ ] Integration: CSMS + 3 chargers → boot accepted, heartbeats received
-- [ ] Scale: 50 chargers all connected within X seconds (first measured number, write it down)
-- [ ] Same seed → same sequence of events
+- [x] Integration: CSMS + 3 chargers → boot accepted, heartbeats received
+- [x] Scale: 50 chargers all booted within 15 s (CI bound). **Measured: 0.060 s** median of 10 runs (0.059–0.065 s) for boot + every StatusNotification of all 50. Context: single process, localhost, embedded CSMS, jitter 0 (all 50 at once), Apple M5 / 24 GB / macOS 26.6, Python 3.13.3, ocpp 2.1.0, websockets 17.4. This is a simulator-throughput number, not a field number: the README **Limitations** section must say so when we publish
+- [x] Same seed → same sequence of events (and adding a charger leaves the others' sequences unchanged)
 
 ### Bonus
 
@@ -110,7 +110,7 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 
 **Done when:** the repo is public, with the demo video and article linked from the portfolio.
 
-- [ ] README: what it is, quick start, architecture, results, **Limitations**, how AI tools were used
+- [ ] README: what it is, quick start, architecture, results, **Limitations** (incl. the context of the week-1 scale number: single process, localhost, jitter 0, dev machine), how AI tools were used
 - [ ] Demo video, 60–90 s
 - [ ] Results table + blog article
 - [ ] Docker setup for one-command demo
@@ -158,6 +158,13 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 | 2026-11-24 | ChangeConfiguration rejects badly formatted values (non-integer / negative ints, non-boolean bools) | A value the charger itself cannot use (e.g. `HeartbeatInterval=abc`) must not crash it |
 | 2026-11-24 | Charger config persists across Reset (lives on the charger, not the connection); connector statuses are kept too | Non-volatile on real chargers; otherwise a reset would silently "fix" config faults. What a reboot clears is decided per fault in week 2 |
 | 2026-11-24 | On Ctrl+C the charger closes with 1001 (going away) | websockets closes with 1011 (internal error) when an exception leaves the connection block; the CSMS would log a clean stop as an error |
+| 2026-11-27 | Reset is a legitimate fix for a wrong HeartbeatInterval. Week-2 fault specs define a "minimal expected fix" per fault; the evaluation scores both resolution and invasiveness (targeted ChangeConfiguration < Reset). Week 2 also includes faults a reboot does not fix (e.g. firmware ignoring the boot interval) | The CSMS re-imposes HeartbeatInterval at every boot (BootNotification.conf `interval`, OCPP 1.6 §4.2), as on real chargers, so a reboot really does fix it. Scoring invasiveness keeps "reboot everything" from looking as good as a targeted fix |
+| 2026-11-27 | Fleet file: templates (id prefix, vendor, model, connectors, count) + global seed, CSMS heartbeat interval, start-up jitter window; Pydantic with `extra="forbid"`; uniqueness checked on the generated ids | Typos must fail loudly; different prefixes can still produce the same id (`CP-` ×1001 vs `CP-1`). No per-template heartbeat interval: the CSMS sets it at boot |
+| 2026-11-27 | One RNG per charger, seeded with `sha256(f"{fleet_seed}/{charger_id}")` (first 8 bytes); its first draw is the start-up delay, `uniform(0, window)` | A shared RNG would make every charger's behavior depend on the others; sha256 is stable across processes and Python versions, unlike `hash()` |
+| 2026-11-27 | Embedded mode logs the CSMS side only (`logs/csms-*.jsonl`); `--csms-url` mode logs the charger side (`logs/fleet-*.jsonl`) | Every message is logged once in each mode, without writing every frame twice |
+| 2026-11-27 | Live table in plain text + ANSI codes (alternate screen, redraw in place), no library; summary line only when stdout is not a TTY; INFO logging off while the table is on | No new dependency; pipes and CI get readable lines; log lines would garble the redraw |
+| 2026-11-27 | Fleet tasks stop before the embedded CSMS on Ctrl+C | Each charger closes with 1001 while the server is still up, so the CSMS log shows clean stops |
+| 2026-11-27 | Scale test measured with jitter 0 and marked `slow` (skippable locally with `-m "not slow"`, run in CI) | Jitter 0 is the worst case for the CSMS; with the default 10 s window the time would only measure the jitter |
 
 ## Open questions
 
@@ -168,8 +175,9 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 - Dead-connection detection time depends on websockets keepalive (`ping_interval` / `ping_timeout`, both 20 s by default, so up to ~40 s). Week 2: make them configurable and measure "time to detect a dead charger".
 - One command at a time per charger (ocpp's `call()` lock): a silent charger blocks all commands to it until the call timeout (default 30 s). Is 30 s right for the agent's time budget (week 3/4)?
 - Real firmwares sometimes send out-of-spec transitions. Week 2 may need a "buggy firmware" fault that bypasses the transition table on purpose, and the CSMS must record such transitions without crashing (and maybe flag them). Not built yet.
-- HeartbeatInterval is re-imposed by the CSMS at every boot (BootNotification.conf `interval`, OCPP 1.6 §4.2), so any reboot "fixes" a wrong HeartbeatInterval, as on real chargers. For the week-2 HeartbeatInterval fault: inject it so it survives a reboot (e.g. a firmware that ignores the boot interval), or accept that Reset is a legitimate fix for it?
 - `ManualTime` lives in `tests/` for now. Promote it to `src/` as the simulated clock for week-4 evaluation runs?
+- The registry stores `boot_time` but not the boot status: the table shows `Accepted` because our CSMS accepts every boot. Week 2 (Pending/Rejected faults) needs a real `boot_status` field.
+- The 50-row table is taller than many terminals; the header scrolls off (the summary line stays visible at the bottom). Fine for the demo; compact or paged view if it bothers us.
 
 ## References (inspiration only)
 

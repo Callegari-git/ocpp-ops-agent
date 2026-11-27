@@ -12,9 +12,12 @@ Requires Python 3.11+.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-make test
+make test          # or: pytest -m "not slow" to skip the real-time scale test
 make lint
+make demo          # embedded CSMS + the 50 chargers of fleet.yaml, live status table (Ctrl+C to stop)
 ```
+
+`make demo` logs every OCPP message to `logs/csms-<time>.jsonl`. To connect the fleet to another CSMS instead: `python -m ocpp_ops.fleet --fleet fleet.yaml --csms-url ws://host:port/path`.
 
 ## Data and IP
 

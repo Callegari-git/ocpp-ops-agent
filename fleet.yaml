@@ -1,0 +1,26 @@
+# Default fleet for `make demo`: 50 chargers across 3 templates.
+# Vendors and models are made up: they imply no real firmware behavior.
+
+seed: 42
+# Seconds. Sent by the embedded CSMS in BootNotification.conf (OCPP 1.6 §4.2).
+# Short so the demo table moves; real chargers often use 300 s or more.
+heartbeat_interval: 30
+# Each charger waits a random 0..10 s (seeded) before its first connection.
+startup_jitter_seconds: 10
+
+templates:
+  - id_prefix: VTX-AC-
+    vendor: Voltrix
+    model: VX-AC22
+    connectors: 2
+    count: 25
+  - id_prefix: AMP-DC-
+    vendor: Ampera
+    model: AmpDC-150
+    connectors: 1
+    count: 15
+  - id_prefix: NWT-AC-
+    vendor: Northwatt
+    model: NW-AC11
+    connectors: 3
+    count: 10

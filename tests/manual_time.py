@@ -3,7 +3,7 @@
 import asyncio
 import heapq
 import itertools
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from fakes import FakeClock
 
@@ -21,7 +21,7 @@ class ManualTime(FakeClock):
     def __init__(self) -> None:
         super().__init__()
         # (deadline, insertion order, future to resolve). The order breaks ties: FIFO.
-        self._sleepers: list[tuple[object, int, asyncio.Future[None]]] = []
+        self._sleepers: list[tuple[datetime, int, asyncio.Future[None]]] = []
         self._order = itertools.count()
         self.requested: list[float] = []  # every duration passed to sleep(), in order
 
@@ -36,6 +36,12 @@ class ManualTime(FakeClock):
     def sleeper_count(self) -> int:
         """Sleeps still waiting (cancelled ones don't count)."""
         return sum(1 for _, _, future in self._sleepers if not future.done())
+
+    @property
+    def next_deadline(self) -> datetime | None:
+        """When the earliest pending sleep ends, or None if nothing is sleeping."""
+        pending = [deadline for deadline, _, future in self._sleepers if not future.done()]
+        return min(pending, default=None)
 
     def advance_to_next(self) -> float:
         """Move time to the earliest pending deadline and wake that sleeper.

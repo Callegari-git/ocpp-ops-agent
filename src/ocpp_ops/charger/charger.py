@@ -5,7 +5,7 @@ import logging
 import random
 import uuid
 from contextlib import suppress
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -93,6 +93,9 @@ class VirtualCharger:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._booted = False
         self._reset_requested = False
+        # When the CSMS last answered one of our Heartbeats, by our clock. Kept across
+        # sessions: it is "last seen" from the charger's side.
+        self._last_heartbeat: datetime | None = None
 
     # --- State, read-only from outside ---
 
@@ -100,8 +103,21 @@ class VirtualCharger:
         return self._connectors[connector_id]
 
     @property
+    def connector_ids(self) -> list[int]:
+        """0 (the charge point as a whole) first, then 1..N."""
+        return list(self._connectors)
+
+    @property
+    def connected(self) -> bool:
+        return self._websocket is not None
+
+    @property
     def booted(self) -> bool:
         return self._booted
+
+    @property
+    def last_heartbeat(self) -> datetime | None:
+        return self._last_heartbeat
 
     # --- The single path for status changes ---
 
@@ -245,6 +261,7 @@ class VirtualCharger:
         while True:
             await self._sleep(self.config.heartbeat_interval)
             await charge_point.send(call.Heartbeat())
+            self._last_heartbeat = self._now()
 
     async def _send_status(self, charge_point: ChargerChargePoint, connector_id: int) -> None:
         state = self._connectors[connector_id]

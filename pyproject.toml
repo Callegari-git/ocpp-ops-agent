@@ -53,3 +53,5 @@ select = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Skip locally with: pytest -m "not slow". CI runs everything.
+markers = ["slow: runs in real time and takes seconds (e.g. the 50-charger scale test)"]
