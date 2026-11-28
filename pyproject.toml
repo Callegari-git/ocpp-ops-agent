@@ -54,4 +54,8 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # Skip locally with: pytest -m "not slow". CI runs everything.
-markers = ["slow: runs in real time and takes seconds (e.g. the 50-charger scale test)"]
+markers = [
+    "slow: runs in real time and takes seconds (e.g. the 50-charger scale test)",
+    # Skipped unless STEVE_URL is set: CI never depends on SteVe. See docs/interop/steve.md.
+    "interop: runs against a third-party CSMS (SteVe) at STEVE_URL",
+]

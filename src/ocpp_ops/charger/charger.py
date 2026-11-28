@@ -39,6 +39,16 @@ BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
 
 
+def charger_endpoint(csms_url: str, charger_id: str) -> str:
+    """The URL a charger connects to: the CSMS base URL plus its identity as the last segment.
+
+    OCPP-J 1.6 §3.1.1. The base can have a path of its own (e.g. SteVe's
+    `ws://host:8180/steve/websocket/CentralSystemService`). The id is fully percent-encoded,
+    "/" included, so it always stays one path segment.
+    """
+    return f"{csms_url.rstrip('/')}/{quote(charger_id, safe='')}"
+
+
 def reconnect_delay(failures: int, rng: random.Random) -> float:
     """Seconds to wait before reconnecting: exponential backoff with seeded jitter.
 
@@ -75,8 +85,7 @@ class VirtualCharger:
     ) -> None:
         self.id = charger_id
         self.config = ConfigStore(number_of_connectors)
-        # OCPP-J 1.6 §3.1.1: the charger's identity is the last segment of the URL path.
-        self._endpoint = f"{csms_url.rstrip('/')}/{quote(charger_id)}"
+        self._endpoint = charger_endpoint(csms_url, charger_id)
         self._now = now
         self._sleep = sleep
         self._rng = rng

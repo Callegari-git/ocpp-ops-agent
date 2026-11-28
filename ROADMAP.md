@@ -58,7 +58,7 @@ Show, with public code and measured numbers, that an AI agent can run real charg
 
 ### Bonus
 
-- [ ] Connect the fleet to a third-party CSMS (SteVe or EVerest/ocpp-csms in Docker) to show interoperability
+- [x] Connect the fleet to a third-party CSMS (SteVe 3.16.0-SNAPSHOT `d5a5d1e6` in Docker) to show interoperability: boot, statuses, heartbeats, GetConfiguration / ChangeConfiguration / Reset from SteVe's UI, no protocol error. 50 chargers boot in 0.182 s against SteVe (same machine, jitter 0). See `docs/interop/steve.md`
 
 ---
 
@@ -173,12 +173,16 @@ Candidate faults (from the OCPP 1.6 spec, to validate):
 | 2026-11-27 | After every ocpp `call()` (charger `ChargerChargePoint.send()`, CSMS `CentralSystem._call()`), `raise_if_cancelling()` (`ocpp_ops/cancellation.py`) re-raises a cancellation that was swallowed | CPython **gh-86296**: on Python 3.11, `asyncio.wait_for()` returns the result instead of raising `CancelledError` when both arrive in the same loop iteration (fixed in 3.12 by rewriting `wait_for` on `asyncio.timeout()`). ocpp 2.1.0 waits for every answer with `wait_for` (**`ocpp/charge_point.py:455`**, in `_get_specific_response`). On 3.11 CI it made a stopping charger carry on booting and start its heartbeat in a TaskGroup that was shutting down (RuntimeError + "never awaited" warning); it could also hang a stopping session for `call_timeout`. The check is `Task.cancelling() > 0`, which 3.11's `wait_for` never resets. **Remove when 3.11 is dropped or ocpp stops using `wait_for`**: the tests below will still pass, since they recreate the behavior themselves |
 | 2026-11-27 | `VirtualCharger._restart_heartbeat()`, the only place that adds a task to a running session, starts nothing when the calling task is being cancelled, and creates the coroutine only after that check | A TaskGroup that is shutting down cancels all its tasks and refuses new ones. Checking our own task's cancellation avoids reading TaskGroup's private `_aborting`. Also covers the ChangeConfiguration path, which is safe today only because its handler is synchronous |
 | 2026-11-27 | The 3.11 behavior is recreated in tests by patching ocpp's `call()` (real answer, then cancel + swallow), for the boot, ChangeConfiguration and CSMS command paths | Deterministic on every Python version. The real race needs a slow machine: the scale test passed 20/20 on local 3.11 before the fix. 3.11 stays in the CI matrix |
+| 2026-11-27 | `charger_endpoint()`: CSMS base URL (any path, trailing slash or not) + `/` + the charger id fully percent-encoded (`quote(id, safe="")`) | Third-party CSMSs put the endpoint under a path (SteVe: `/steve/websocket/CentralSystemService`); `quote()`'s default leaves `/` unencoded, which would split an id into two path segments |
+| 2026-11-27 | Interop tests (`tests/test_interop_steve.py`, marker `interop`) skipped unless `STEVE_URL` is set; they check boot, statuses, adopted interval and time 50 boots. UI-triggered commands were checked by hand and recorded in `docs/interop/steve.md` | CI must never depend on an external CSMS; driving SteVe's UI or REST API from tests would couple us to its internals for little gain |
+| 2026-11-27 | Nothing from SteVe in the repo: no code, config or compose file; the doc describes the setup in our own words | SteVe is GPL, this repo is MIT |
+| 2026-11-27 | SteVe boot time recorded with its context: 0.182 s median for 50 chargers (5 runs, 0.152–0.252 s), jitter 0, SteVe in Docker Desktop + MariaDB on the same machine | Comparable with the embedded 0.060 s only with that context; the README Limitations section must state it, like the embedded number |
 
 ## Open questions
 
 - Simulated clock vs real time for heartbeats and timeouts? (Real time is simpler; a simulated clock makes the evaluation much faster.)
 - Which LLM(s) to evaluate in week 4, and with what budget per incident?
-- Messages before an accepted BootNotification: the CSMS currently accepts them. Should it reject them (OCPP 1.6 §4.2)? Decide in week 2 together with the Pending/Rejected boot faults.
+- Messages before an accepted BootNotification: the CSMS currently accepts them. Should it reject them (OCPP 1.6 §4.2)? Decide in week 2 together with the Pending/Rejected boot faults. Related, seen with SteVe: it sends GetConfiguration *before* answering BootNotification, so the config it stores predates the boot interval. Check the spec PDF: gray area or deviation?
 - SIGTERM (Docker stop, week 5) is not handled yet; only Ctrl+C/SIGINT shuts down cleanly.
 - Dead-connection detection time depends on websockets keepalive (`ping_interval` / `ping_timeout`, both 20 s by default, so up to ~40 s). Week 2: make them configurable and measure "time to detect a dead charger".
 - One command at a time per charger (ocpp's `call()` lock): a silent charger blocks all commands to it until the call timeout (default 30 s). Is 30 s right for the agent's time budget (week 3/4)?

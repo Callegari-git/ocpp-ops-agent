@@ -20,10 +20,11 @@ from websockets.exceptions import ConnectionClosed
 
 from fakes import HEARTBEAT_INTERVAL, OCPP16, CsmsHarness, running_csms, wait_until
 from manual_time import ManualTime
-from ocpp_ops.charger.charger import VirtualCharger
+from ocpp_ops.charger.charger import VirtualCharger, charger_endpoint
 from ocpp_ops.charger.protocol import ChargerChargePoint
 from ocpp_ops.charger.state_machine import InvalidTransitionError
 from ocpp_ops.csms.registry import ChargerState, ConfigurationKey
+from ocpp_ops.csms.server import charger_id_from_path
 from ocpp_ops.message_log import LogRecord, MessageLog
 from sim import REBOOT_DELAY, make_charger, running
 
@@ -55,6 +56,33 @@ async def _wait_idle(time: ManualTime, charger: VirtualCharger, *, booted: bool)
 
 def _read_log(path: Path) -> list[LogRecord]:
     return [LogRecord.model_validate_json(line) for line in path.read_text().splitlines()]
+
+
+# --- Endpoint ---------------------------------------------------------------------------
+
+STEVE_BASE = "ws://localhost:8180/steve/websocket/CentralSystemService"
+
+
+@pytest.mark.parametrize("base", [STEVE_BASE, STEVE_BASE + "/"])
+def test_endpoint_appends_the_id_to_a_base_path(base: str) -> None:
+    assert charger_endpoint(base, "VTX-AC-001") == f"{STEVE_BASE}/VTX-AC-001"
+
+
+def test_endpoint_keeps_any_id_in_one_path_segment() -> None:
+    url = charger_endpoint(STEVE_BASE, "CP/1 a")
+    assert url == f"{STEVE_BASE}/CP%2F1%20a"
+    # Our CSMS reads back the same id.
+    assert charger_id_from_path(url.removeprefix("ws://localhost:8180")) == "CP/1 a"
+
+
+async def test_charger_with_unusual_id_boots(time: ManualTime, sim_csms: CsmsHarness) -> None:
+    async with running(make_charger(sim_csms.url + "/some/base/", time, charger_id="CP/1 a")):
+        await wait_until(
+            lambda: (
+                (state := sim_csms.registry.get("CP/1 a")) is not None
+                and state.boot_time is not None
+            )
+        )
 
 
 # --- Boot and heartbeats ---------------------------------------------------------------
