@@ -8,19 +8,40 @@ heartbeat_interval: 30
 # Each charger waits a random 0..10 s (seeded) before its first connection.
 startup_jitter_seconds: 10
 
+# Per template: `current` (AC or DC) and optionally `max_power_kw`, per connector (defaults:
+# AC 11 kW, DC 50 kW). Every charging connector draws it in full: no load sharing, although
+# real DC chargers usually share their power across connectors (smart charging is out of
+# scope). `plugged_status_after_reboot`: what a connector with a cable still plugged in
+# reports after a reboot, Finishing (default), Preparing or Available; vendors differ.
 templates:
   - id_prefix: VTX-AC-
     vendor: Voltrix
     model: VX-AC22
     connectors: 2
     count: 25
+    current: AC
+    max_power_kw: 22
   - id_prefix: AMP-DC-
     vendor: Ampera
     model: AmpDC-150
     connectors: 1
     count: 15
+    current: DC
+    max_power_kw: 150
   - id_prefix: NWT-AC-
     vendor: Northwatt
     model: NW-AC11
     connectors: 3
     count: 10
+    current: AC
+    plugged_status_after_reboot: Preparing
+
+# Simulated drivers, each connector on its own seeded stream (remove this section for an
+# idle fleet). Demo speed: real connectors sit idle for hours and AC sessions last hours;
+# these minutes keep the grid moving. Tags come from the authorization list (--id-tags).
+usage:
+  mean_idle_minutes: 3
+  charge_minutes: {min: 1, max: 6}
+  driver_stop_share: 0.6
+  stay_after_stop_minutes: {min: 0.2, max: 1}
+  refused_tag_share: 0.1

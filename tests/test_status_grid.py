@@ -116,14 +116,18 @@ def test_no_escape_codes_at_all_without_colors() -> None:
 
 def test_summary_line() -> None:
     rows = [
-        row("A", (S.available, S.available, S.charging)),
+        row("A", (S.available, S.available, S.charging), sessions=1, power_w=7_400),
         row("B", (S.available, S.faulted), errors={1: E.ground_failure}),
-        row("C", connected=False),
+        # Offline: its last known sessions may be stale, so they are not counted.
+        row("C", connected=False, sessions=2, power_w=22_000),
         row("D", booted=False),
     ]
     assert summary(rows, NOW) == (
-        "12:00:00 UTC  3/4 connected, 2 booted  |  connectors: 1 Available, 1 Charging, 1 Faulted"
+        "12:00:00 UTC  3/4 connected, 2 booted  |  1 session, 7.4 kW"
+        "  |  connectors: 1 Available, 1 Charging, 1 Faulted"
     )
+    two = [row("A", sessions=1, power_w=11_000), row("B", sessions=1, power_w=150_000)]
+    assert "|  2 sessions, 161.0 kW  |" in summary(two, NOW)
     assert summary([row(connected=False)], NOW).endswith("connectors: none online")
 
 
@@ -208,9 +212,9 @@ async def test_pipe_gets_one_summary_line_per_refresh() -> None:
     out = io.StringIO()  # isatty() is False, like a pipe
     time = await _run_refreshes(out, [row("CP-1")], refreshes=3)
     assert out.getvalue().splitlines() == [
-        "12:00:00 UTC  1/1 connected, 1 booted  |  connectors: 2 Available",
-        "12:00:01 UTC  1/1 connected, 1 booted  |  connectors: 2 Available",
-        "12:00:02 UTC  1/1 connected, 1 booted  |  connectors: 2 Available",
+        "12:00:00 UTC  1/1 connected, 1 booted  |  0 sessions, 0.0 kW  |  connectors: 2 Available",
+        "12:00:01 UTC  1/1 connected, 1 booted  |  0 sessions, 0.0 kW  |  connectors: 2 Available",
+        "12:00:02 UTC  1/1 connected, 1 booted  |  0 sessions, 0.0 kW  |  connectors: 2 Available",
     ]
     assert time.requested == [1.0, 1.0, 1.0]
 

@@ -1,10 +1,19 @@
 """The fleet file (fleet.yaml): which chargers to simulate, validated with Pydantic."""
 
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 import yaml
+from ocpp.v16.enums import ChargePointStatus
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+CurrentType = Literal["AC", "DC"]
+# Per connector, when the template gives no max_power_kw. AC: 3-phase 16 A (3 x 230 V x 16 A
+# ~ 11 kW), the most common AC point. DC: 50 kW, the classic first-generation fast charger.
+DEFAULT_MAX_POWER_KW: dict[CurrentType, float] = {"AC": 11.0, "DC": 50.0}
+# Upper bounds, to catch typos (e.g. watts written as kW). AC: 3-phase 63 A, the most an AC
+# connector can deliver (3 x 230 V x 63 A ~ 43.5 kW). DC: 400 kW, above today's fastest.
+MAX_POWER_LIMIT_KW: dict[CurrentType, float] = {"AC": 43.5, "DC": 400.0}
 
 
 class FleetFileError(Exception):
@@ -24,6 +33,29 @@ class ChargerTemplate(_Strict):
     model: str = Field(min_length=1)
     connectors: int = Field(ge=1)
     count: int = Field(ge=1)
+    current: CurrentType
+    # Per connector: every charging connector draws this much at once. No load sharing (smart
+    # charging is out of scope), although real DC chargers usually share their power across
+    # connectors. Default: DEFAULT_MAX_POWER_KW.
+    max_power_kw: float | None = Field(default=None, gt=0)
+    # What a connector with a cable still plugged in reports after a reboot: vendors differ.
+    plugged_status_after_reboot: Literal["Finishing", "Preparing", "Available"] = "Finishing"
+
+    @model_validator(mode="after")
+    def _power_is_plausible(self) -> Self:
+        limit = MAX_POWER_LIMIT_KW[self.current]
+        if self.max_power_kw is not None and self.max_power_kw > limit:
+            raise ValueError(f"max_power_kw: {self.current} connectors deliver at most {limit} kW")
+        return self
+
+    @property
+    def max_power_w(self) -> int:
+        kw = (
+            self.max_power_kw
+            if self.max_power_kw is not None
+            else DEFAULT_MAX_POWER_KW[self.current]
+        )
+        return round(kw * 1000)
 
     def charger_ids(self) -> list[str]:
         return [f"{self.id_prefix}{n:03d}" for n in range(1, self.count + 1)]
@@ -36,6 +68,36 @@ class ChargerSpec(_Strict):
     vendor: str
     model: str
     connectors: int
+    max_power_w: int  # per connector
+    plugged_status_after_reboot: ChargePointStatus = ChargePointStatus.finishing
+
+
+class MinMax(_Strict):
+    """A range to draw from uniformly."""
+
+    min: float = Field(ge=0)
+    max: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> Self:
+        if self.min > self.max:
+            raise ValueError("min must not be greater than max")
+        return self
+
+
+class Usage(_Strict):
+    """Simulated drivers (see fleet/usage.py). Each connector gets its own seeded stream of
+    visits. Durations in minutes."""
+
+    # Mean time between a driver leaving and the next one arriving (exponential).
+    mean_idle_minutes: float = Field(gt=0)
+    charge_minutes: MinMax
+    # Drivers who stop the session themselves (Local), then unplug after
+    # stay_after_stop_minutes. The others just unplug: EVDisconnected.
+    driver_stop_share: float = Field(ge=0, le=1)
+    stay_after_stop_minutes: MinMax
+    # Arrivals presenting a Blocked or Expired tag (from the authorization list).
+    refused_tag_share: float = Field(ge=0, le=1)
 
 
 class Fleet(_Strict):
@@ -46,6 +108,8 @@ class Fleet(_Strict):
     # Each charger waits uniform(0, window) seconds before its first connection.
     startup_jitter_seconds: float = Field(ge=0)
     templates: list[ChargerTemplate] = Field(min_length=1)
+    # None: nobody uses the chargers (tests drive sessions themselves).
+    usage: Usage | None = None
 
     @model_validator(mode="after")
     def _ids_are_unique(self) -> Self:
@@ -64,7 +128,14 @@ class Fleet(_Strict):
 
     def chargers(self) -> list[ChargerSpec]:
         return [
-            ChargerSpec(id=charger_id, vendor=t.vendor, model=t.model, connectors=t.connectors)
+            ChargerSpec(
+                id=charger_id,
+                vendor=t.vendor,
+                model=t.model,
+                connectors=t.connectors,
+                max_power_w=t.max_power_w,
+                plugged_status_after_reboot=ChargePointStatus(t.plugged_status_after_reboot),
+            )
             for t in self.templates
             for charger_id in t.charger_ids()
         ]

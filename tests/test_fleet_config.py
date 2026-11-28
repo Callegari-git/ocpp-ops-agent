@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from ocpp.v16.enums import ChargePointStatus as S
 
 from ocpp_ops.fleet.config import FleetFileError, load_fleet
 
@@ -13,8 +14,8 @@ seed: 1
 heartbeat_interval: 30
 startup_jitter_seconds: 5
 templates:
-  - {id_prefix: A-, vendor: V, model: M, connectors: 2, count: 2}
-  - {id_prefix: B-, vendor: W, model: N, connectors: 1, count: 1}
+  - {id_prefix: A-, vendor: V, model: M, connectors: 2, count: 2, current: AC}
+  - {id_prefix: B-, vendor: W, model: N, connectors: 1, count: 1, current: DC}
 """
 
 
@@ -48,7 +49,7 @@ def test_templates_expand_to_numbered_chargers(tmp_path: Path) -> None:
         # A typo in a key is an error, not silently ignored.
         (("connectors: 2", "conectors: 2"), "templates.0.conectors: Extra inputs"),
         (("connectors: 2, ", ""), "templates.0.connectors: Field required"),
-        (("count: 1}", "count: 0}"), "templates.1.count: Input should be greater than or equal"),
+        (("count: 1,", "count: 0,"), "templates.1.count: Input should be greater than or equal"),
         (("heartbeat_interval: 30", "heartbeat_interval: 0"), "heartbeat_interval: Input"),
         (("startup_jitter_seconds: 5", "startup_jitter_seconds: -1"), "startup_jitter_seconds"),
         (("seed: 1", "seed: abc"), "seed: Input should be a valid integer"),
@@ -66,9 +67,79 @@ def test_invalid_field_names_the_field(
     assert expected in str(error.value)
 
 
+def test_default_fleet_power_and_usage() -> None:
+    fleet = load_fleet(DEFAULT_FLEET)
+    by_prefix = {t.id_prefix: t for t in fleet.templates}
+    assert {prefix: t.max_power_w for prefix, t in by_prefix.items()} == {
+        "VTX-AC-": 22_000,
+        "AMP-DC-": 150_000,
+        "NWT-AC-": 11_000,  # the AC default
+    }
+    assert fleet.usage is not None  # `make demo` shows sessions
+
+
+@pytest.mark.parametrize(("current", "expected_w"), [("AC", 11_000), ("DC", 50_000)])
+def test_max_power_defaults_per_current(tmp_path: Path, current: str, expected_w: int) -> None:
+    text = VALID.replace("current: AC}", f"current: {current}}}")
+    [first, *_] = load_fleet(_write(tmp_path, text)).chargers()
+    assert first.max_power_w == expected_w
+    assert first.plugged_status_after_reboot == S.finishing
+
+
+def test_template_options_reach_the_chargers(tmp_path: Path) -> None:
+    text = VALID.replace(
+        "current: AC}", "current: AC, max_power_kw: 7.4, plugged_status_after_reboot: Available}"
+    )
+    [first, *_] = load_fleet(_write(tmp_path, text)).chargers()
+    assert (first.max_power_w, first.plugged_status_after_reboot) == (7_400, S.available)
+
+
+USAGE = """
+usage:
+  mean_idle_minutes: 3
+  charge_minutes: {min: 1, max: 6}
+  driver_stop_share: 0.5
+  stay_after_stop_minutes: {min: 0, max: 1}
+  refused_tag_share: 0.1
+"""
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (("current: AC}", "current: ac}"), "templates.0.current: Input should be 'AC' or 'DC'"),
+        ((", current: AC}", "}"), "templates.0.current: Field required"),
+        (("current: AC}", "current: AC, max_power_kw: 0}"), "max_power_kw: Input should be"),
+        # Typos such as watts written as kW are caught by the bounds.
+        (("current: AC}", "current: AC, max_power_kw: 50}"), "AC connectors deliver at most"),
+        (("current: DC}", "current: DC, max_power_kw: 7400}"), "DC connectors deliver at most"),
+        (
+            ("current: AC}", "current: AC, plugged_status_after_reboot: Charging}"),
+            "plugged_status_after_reboot: Input should be",
+        ),
+        (("max: 6}", "max: 0.5}"), "usage.charge_minutes: Value error, min must not be"),
+        (("refused_tag_share: 0.1", "refused_tag_share: 2"), "usage.refused_tag_share"),
+        (("mean_idle_minutes: 3", "mean_idle_minutes: 0"), "usage.mean_idle_minutes"),
+        (("driver_stop_share", "driver_stops_share"), "usage.driver_stops_share: Extra inputs"),
+    ],
+)
+def test_invalid_power_and_usage(tmp_path: Path, change: tuple[str, str], expected: str) -> None:
+    path = _write(tmp_path, (VALID + USAGE).replace(*change))
+    with pytest.raises(FleetFileError) as error:
+        load_fleet(path)
+    assert expected in str(error.value)
+
+
+def test_usage_is_optional(tmp_path: Path) -> None:
+    assert load_fleet(_write(tmp_path, VALID)).usage is None
+    usage = load_fleet(_write(tmp_path, VALID + USAGE)).usage
+    assert usage is not None
+    assert (usage.charge_minutes.min, usage.charge_minutes.max) == (1, 6)
+
+
 def test_different_prefixes_can_still_collide(tmp_path: Path) -> None:
     # "A-" + "1001" == "A-1" + "001"
-    text = VALID.replace("count: 2}", "count: 1001}").replace("id_prefix: B-", "id_prefix: A-1")
+    text = VALID.replace("count: 2,", "count: 1001,").replace("id_prefix: B-", "id_prefix: A-1")
     with pytest.raises(FleetFileError, match="duplicate charger ids: A-1001"):
         load_fleet(_write(tmp_path, text))
 

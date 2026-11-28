@@ -23,6 +23,8 @@ def row(
     boot_ago: float | None | Literal["auto"] = "auto",
     heartbeat_ago: float | None = None,
     interval: int = INTERVAL,
+    sessions: int = 0,
+    power_w: float = 0.0,
 ) -> ChargerRow:
     """`statuses[i]` is connector i's status (connector 0 first). Times are seconds before NOW.
 
@@ -44,6 +46,8 @@ def row(
         boot_time=_ago(boot_ago),
         last_heartbeat=_ago(heartbeat_ago),
         heartbeat_interval=interval,
+        active_sessions=sessions,
+        power_w=power_w,
     )
 
 

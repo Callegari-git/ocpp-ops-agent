@@ -38,8 +38,11 @@ def _all_booted(registry: Registry, chargers: list[ChargerSpec]) -> bool:
 async def test_fifty_chargers_boot_within_bound(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Jitter 0: all 50 connect at once, the worst case for the CSMS.
-    fleet = load_fleet(DEFAULT_FLEET).model_copy(update={"startup_jitter_seconds": 0})
+    # Jitter 0: all 50 connect at once, the worst case for the CSMS. No drivers: this
+    # measures boots only.
+    fleet = load_fleet(DEFAULT_FLEET).model_copy(
+        update={"startup_jitter_seconds": 0, "usage": None}
+    )
     chargers = fleet.chargers()
     assert len(chargers) == 50
 

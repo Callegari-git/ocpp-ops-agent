@@ -1,6 +1,12 @@
 """Results and errors of the CSMS's outbound commands (CSMS -> charger)."""
 
-from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
+from ocpp.v16.enums import (
+    AvailabilityStatus,
+    AvailabilityType,
+    ConfigurationStatus,
+    ResetStatus,
+    ResetType,
+)
 from pydantic import BaseModel
 
 from ocpp_ops.csms.registry import ConfigurationKey
@@ -20,6 +26,13 @@ class ChangeConfigurationResult(BaseModel):
 class ResetResult(BaseModel):
     type: ResetType
     status: ResetStatus
+
+
+class ChangeAvailabilityResult(BaseModel):
+    connector_id: int  # 0: the charge point and all its connectors
+    type: AvailabilityType
+    # Scheduled: the change waits for the end of a transaction in progress (§5.2).
+    status: AvailabilityStatus
 
 
 class CommandError(Exception):

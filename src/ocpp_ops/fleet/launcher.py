@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from ocpp_ops.charger.charger import VirtualCharger
 from ocpp_ops.clock import Clock, Sleep
 from ocpp_ops.fleet.config import Fleet
+from ocpp_ops.fleet.usage import Driver, TagPool, usage_seed
 from ocpp_ops.message_log import MessageLog
 
 
@@ -16,6 +17,8 @@ class FleetMember:
     charger: VirtualCharger
     # Seconds to wait before the first connection, so the fleet doesn't connect all at once.
     startup_delay: float
+    # One per connector when the fleet file has a `usage` section, otherwise none.
+    drivers: tuple[Driver, ...] = ()
 
 
 def charger_seed(fleet_seed: int, charger_id: str) -> int:
@@ -36,7 +39,12 @@ def build_fleet(
     now: Clock,
     sleep: Sleep,
     log: MessageLog | None = None,
+    tags: TagPool | None = None,
 ) -> list[FleetMember]:
+    """The fleet's chargers, not started yet. `tags` is required when the fleet has usage:
+    the idTags drivers present."""
+    if fleet.usage is not None and tags is None:
+        raise ValueError("a fleet with usage needs the tags drivers present")
     members = []
     for spec in fleet.chargers():
         rng = random.Random(charger_seed(fleet.seed, spec.id))
@@ -53,8 +61,22 @@ def build_fleet(
             vendor=spec.vendor,
             model=spec.model,
             log=log,
+            max_power_w=spec.max_power_w,
+            plugged_status_after_reboot=spec.plugged_status_after_reboot,
         )
-        members.append(FleetMember(charger, startup_delay))
+        drivers: tuple[Driver, ...] = ()
+        if fleet.usage is not None and tags is not None:
+            drivers = tuple(
+                Driver(
+                    charger,
+                    connector_id,
+                    fleet.usage,
+                    tags,
+                    random.Random(usage_seed(fleet.seed, spec.id, connector_id)),
+                )
+                for connector_id in range(1, spec.connectors + 1)
+            )
+        members.append(FleetMember(charger, startup_delay, drivers))
     return members
 
 
@@ -70,5 +92,10 @@ async def run_fleet(members: list[FleetMember], sleep: Sleep) -> None:
 
 
 async def _start(member: FleetMember, sleep: Sleep) -> None:
+    """Start-up delay, then the charger and its drivers. Drivers only act once the charger
+    has booted, so they start together with it."""
     await sleep(member.startup_delay)
-    await member.charger.run()
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(member.charger.run())
+        for driver in member.drivers:
+            tasks.create_task(driver.run(sleep))

@@ -5,13 +5,20 @@ from typing import Any
 
 from ocpp.exceptions import OCPPError
 from ocpp.v16 import call
-from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
+from ocpp.v16.enums import (
+    AvailabilityStatus,
+    AvailabilityType,
+    ConfigurationStatus,
+    ResetStatus,
+    ResetType,
+)
 from websockets.exceptions import ConnectionClosed
 
 from ocpp_ops.cancellation import raise_if_cancelling
 from ocpp_ops.clock import Clock
 from ocpp_ops.csms.authorization import AuthorizationList
 from ocpp_ops.csms.commands import (
+    ChangeAvailabilityResult,
     ChangeConfigurationResult,
     ChargerCallError,
     ChargerNotConnectedError,
@@ -114,6 +121,18 @@ class CentralSystem:
         """Ask the charger to reboot (Soft or Hard)."""
         response = await self._call(charger_id, call.Reset(type=type))
         return ResetResult(type=type, status=ResetStatus(response.status))
+
+    async def change_availability(
+        self, charger_id: str, connector_id: int, type: AvailabilityType
+    ) -> ChangeAvailabilityResult:
+        """Ask the charger to make a connector (0: the whole charger) Operative or
+        Inoperative. The new status itself arrives later, as a StatusNotification."""
+        response = await self._call(
+            charger_id, call.ChangeAvailability(connector_id=connector_id, type=type)
+        )
+        return ChangeAvailabilityResult(
+            connector_id=connector_id, type=type, status=AvailabilityStatus(response.status)
+        )
 
     async def _call(self, charger_id: str, request: Any) -> Any:
         """Send one CALL and return the charger's response payload, or raise a CommandError."""

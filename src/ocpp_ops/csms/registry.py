@@ -52,20 +52,37 @@ class MeterReading(_Model):
 
 
 ENERGY_REGISTER = "Energy.Active.Import.Register"
+POWER = "Power.Active.Import"
 # OCPP 1.6 §7.31: the energy register is reported in Wh or kWh.
 _WH_PER_UNIT = {"Wh": 1.0, "kWh": 1000.0}
+# §7.43 UnitOfMeasure: power in W or kW.
+_W_PER_UNIT = {"W": 1.0, "kW": 1000.0}
 
 
 def energy_register_wh(reading: MeterReading) -> float | None:
     """The energy register (overall, not per phase) of a reading in Wh, or None if absent.
 
     §7.43: a sampled value without measurand is the energy register, and without unit it is
-    in Wh. Values we can't read as numbers (e.g. format SignedData) are skipped.
+    in Wh.
     """
+    return _measurand(reading, ENERGY_REGISTER, _WH_PER_UNIT)
+
+
+def power_w(reading: MeterReading) -> float | None:
+    """Power.Active.Import (overall, not per phase) of a reading in W, or None if absent.
+    Without a unit we assume W: §7.43 only defines the default (Wh) for energy."""
+    return _measurand(reading, POWER, _W_PER_UNIT)
+
+
+def _measurand(reading: MeterReading, measurand: str, factors: dict[str, float]) -> float | None:
+    """The first overall value of `measurand`, converted with `factors` (by unit; the first
+    unit listed is the default). Values we can't read as numbers (e.g. format SignedData) or
+    in an unknown unit are skipped."""
+    default_unit = next(iter(factors))
     for sampled in reading.sampled_values:
-        if (sampled.measurand or ENERGY_REGISTER) != ENERGY_REGISTER or sampled.phase:
+        if (sampled.measurand or ENERGY_REGISTER) != measurand or sampled.phase:
             continue
-        factor = _WH_PER_UNIT.get(sampled.unit or "Wh")
+        factor = factors.get(sampled.unit or default_unit)
         if factor is None:
             continue
         try:

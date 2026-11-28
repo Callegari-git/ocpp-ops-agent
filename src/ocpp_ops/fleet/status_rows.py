@@ -12,7 +12,7 @@ from enum import IntEnum
 from ocpp.v16.enums import ChargePointErrorCode, ChargePointStatus
 
 from ocpp_ops.charger.charger import VirtualCharger
-from ocpp_ops.csms.registry import ConnectorState, Registry
+from ocpp_ops.csms.registry import ChargerState, ConnectorState, Registry, power_w
 from ocpp_ops.fleet.config import ChargerSpec
 
 # A heartbeat is late once this many intervals have passed without one.
@@ -38,6 +38,8 @@ class ChargerRow:
     boot_time: datetime | None
     last_heartbeat: datetime | None
     heartbeat_interval: int  # seconds; 0 means heartbeats are off
+    active_sessions: int = 0  # transactions in progress
+    power_w: float = 0.0  # being drawn now, all connectors together
 
     @property
     def online(self) -> bool:
@@ -80,9 +82,21 @@ def rows_from_registry(
                 state.boot_time,
                 state.last_heartbeat,
                 heartbeat_interval,
+                len(state.active_transactions),
+                _power_w(state),
             )
         )
     return rows
+
+
+def _power_w(state: ChargerState) -> float:
+    """From the last MeterValues of each transaction in progress: 0 until its first sample."""
+    total = 0.0
+    for transaction in state.active_transactions.values():
+        reading = transaction.last_meter_value
+        if reading is not None:
+            total += power_w(reading) or 0.0
+    return total
 
 
 def _from_registry(connector: ConnectorState | None) -> ConnectorView:
@@ -110,12 +124,21 @@ def rows_from_chargers(chargers: list[VirtualCharger]) -> list[ChargerRow]:
                 charger.last_heartbeat,
                 # What the CSMS imposed at boot (or changed since).
                 charger.config.heartbeat_interval,
+                charger.active_transactions,
+                charger.power_w,
             )
         )
     return rows
 
 
 # --- Counting ----------------------------------------------------------------------------
+
+
+def sessions_and_power(rows: list[ChargerRow]) -> tuple[int, float]:
+    """Transactions in progress and the power they draw (W), on online chargers only, as
+    in connector_counts()."""
+    online = [row for row in rows if row.online]
+    return sum(row.active_sessions for row in online), sum(row.power_w for row in online)
 
 
 def connector_counts(rows: list[ChargerRow]) -> dict[ChargePointStatus, int]:

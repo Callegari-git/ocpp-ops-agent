@@ -2,13 +2,14 @@
 
 import random
 
+from ocpp.v16.enums import AuthorizationStatus
 from ocpp.v16.enums import ChargePointErrorCode as E
 from ocpp.v16.enums import ChargePointStatus as S
 
 from fakes import FakeClock
 from manual_time import ManualTime
 from ocpp_ops.charger.charger import VirtualCharger
-from ocpp_ops.csms.registry import Registry
+from ocpp_ops.csms.registry import MeterReading, Registry, SampledValue
 from ocpp_ops.fleet.config import ChargerSpec
 from ocpp_ops.fleet.status_rows import (
     ChargerRow,
@@ -23,7 +24,9 @@ from status_helpers import INTERVAL, NOW, row
 
 
 def _spec(charger_id: str, connectors: int = 1) -> ChargerSpec:
-    return ChargerSpec(id=charger_id, vendor="V", model="M", connectors=connectors)
+    return ChargerSpec(
+        id=charger_id, vendor="V", model="M", connectors=connectors, max_power_w=11_000
+    )
 
 
 # --- Building rows -----------------------------------------------------------------------
@@ -61,6 +64,29 @@ def test_rows_from_registry() -> None:
             None, INTERVAL,
         ),
     ]  # fmt: skip
+
+
+def test_rows_from_registry_sessions_and_power() -> None:
+    """Power comes from each transaction's last MeterValues: 0 until its first sample."""
+    clock = FakeClock()
+    registry = Registry(now=clock)
+    registry.connect("CP-1")
+    registry.record_boot("CP-1", "V", "M")
+    for connector_id in (1, 2):
+        registry.start_transaction(
+            "CP-1", connector_id, "TAG", AuthorizationStatus.accepted, 0, clock()
+        )
+    sampled = [
+        SampledValue(value="2467", measurand="Power.Active.Import", unit="W", phase="L1"),
+        SampledValue(value="7.4", measurand="Power.Active.Import", unit="kW"),
+    ]
+    reading = MeterReading(timestamp=clock(), sampled_values=sampled)
+    registry.record_meter_value("CP-1", 1, reading, transaction_id=1)
+
+    [charger] = rows_from_registry([_spec("CP-1", 2)], registry, INTERVAL)
+
+    # The per-phase value is not the total: only the overall 7.4 kW counts.
+    assert (charger.active_sessions, charger.power_w) == (2, 7_400)
 
 
 def test_rows_from_registry_disconnected_charger_is_not_booted() -> None:

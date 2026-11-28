@@ -66,6 +66,7 @@ def _not_booted(records: list[LogRecord], specs: list[ChargerSpec]) -> list[str]
 
 async def _boot_against_steve(fleet: Fleet, log_path: Path) -> tuple[float, list[FleetMember]]:
     """Run the fleet against SteVe until every charger has booted. Returns the time taken."""
+    fleet = fleet.model_copy(update={"usage": None})  # boots only: no drivers
     specs = fleet.chargers()
     with MessageLog(log_path) as log:
         members = build_fleet(fleet, STEVE_URL, now=utc_now, sleep=asyncio.sleep, log=log)

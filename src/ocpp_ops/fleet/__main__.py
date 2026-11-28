@@ -24,6 +24,7 @@ from ocpp_ops.fleet.config import Fleet, FleetFileError, load_fleet
 from ocpp_ops.fleet.launcher import FleetMember, build_fleet, run_fleet
 from ocpp_ops.fleet.status_grid import show_status
 from ocpp_ops.fleet.status_rows import ChargerRow, rows_from_chargers, rows_from_registry
+from ocpp_ops.fleet.usage import TagPool
 from ocpp_ops.message_log import MessageLog
 
 logger = logging.getLogger("ocpp_ops.fleet")
@@ -44,7 +45,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--id-tags",
         type=Path,
         default=Path("id_tags.yaml"),
-        help="authorization list of the embedded CSMS (not used with --csms-url)",
+        help="authorization list of the embedded CSMS; with usage, also the tags drivers present",
     )
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="JSONL log directory")
     return parser.parse_args(argv)
@@ -74,7 +75,9 @@ async def run_embedded(
         async with server:
             url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
             logger.info("Embedded CSMS listening on %s (log: %s)", url, log.path)
-            members = build_fleet(fleet, url, now=utc_now, sleep=asyncio.sleep)
+            members = build_fleet(
+                fleet, url, now=utc_now, sleep=asyncio.sleep, tags=_tags(fleet, authorization)
+            )
             specs = fleet.chargers()
             await _run_with_status(
                 members,
@@ -84,15 +87,34 @@ async def run_embedded(
             )
 
 
-async def run_external(fleet: Fleet, csms_url: str, log_dir: Path) -> None:
-    """Fleet only, against an external CSMS. The charger-side log records every message."""
+async def run_external(
+    fleet: Fleet, csms_url: str, log_dir: Path, authorization: AuthorizationList | None
+) -> None:
+    """Fleet only, against an external CSMS. The charger-side log records every message.
+
+    With usage, drivers present tags from our authorization list; the external CSMS decides
+    whether it knows them.
+    """
     with MessageLog(_log_file(log_dir, "fleet")) as log:
         logger.info("Connecting the fleet to %s (log: %s)", csms_url, log.path)
         # OCPP 1.6 §4.2: the CSMS sets the heartbeat interval in BootNotification.conf.
         logger.info("heartbeat_interval from the fleet file is not used: the CSMS sets it")
-        members = build_fleet(fleet, csms_url, now=utc_now, sleep=asyncio.sleep, log=log)
+        members = build_fleet(
+            fleet,
+            csms_url,
+            now=utc_now,
+            sleep=asyncio.sleep,
+            log=log,
+            tags=_tags(fleet, authorization),
+        )
         chargers = [member.charger for member in members]
         await _run_with_status(members, lambda: rows_from_chargers(chargers))
+
+
+def _tags(fleet: Fleet, authorization: AuthorizationList | None) -> TagPool | None:
+    if fleet.usage is None or authorization is None:
+        return None
+    return TagPool.from_authorization(authorization)
 
 
 async def _run_with_status(
@@ -118,14 +140,20 @@ def main(argv: list[str] | None = None) -> None:
     except FleetFileError as error:
         sys.exit(f"Invalid fleet file:\n{error}")
     logger.info("Fleet: %d chargers, seed %d", len(fleet.chargers()), fleet.seed)
+    authorization = None
+    # Needed by the embedded CSMS, and by drivers (usage) in both modes.
+    if not args.csms_url or fleet.usage is not None:
+        try:
+            authorization = load_authorization_list(args.id_tags)
+            if fleet.usage is not None:
+                TagPool.from_authorization(authorization)  # fails early if unusable
+        except (AuthorizationFileError, ValueError) as error:
+            sys.exit(f"Invalid authorization file:\n{error}")
     try:
         if args.csms_url:
-            asyncio.run(run_external(fleet, args.csms_url, args.log_dir))
+            asyncio.run(run_external(fleet, args.csms_url, args.log_dir, authorization))
         else:
-            try:
-                authorization = load_authorization_list(args.id_tags)
-            except AuthorizationFileError as error:
-                sys.exit(f"Invalid authorization file:\n{error}")
+            assert authorization is not None
             asyncio.run(run_embedded(fleet, args.port, args.log_dir, authorization))
     except KeyboardInterrupt:
         # Cleanup already happened inside run_*(); see run_embedded's docstring. Printed,

@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
+from ocpp.v16.enums import ChargePointStatus
+
 from fakes import CsmsHarness, wait_until
 from manual_time import ManualTime
 from ocpp_ops.charger.charger import DEFAULT_MAX_POWER_W, VirtualCharger
@@ -24,6 +26,7 @@ def make_charger(
     log: MessageLog | None = None,
     max_power_w: int = DEFAULT_MAX_POWER_W,
     sleep: Sleep | None = None,
+    plugged_status_after_reboot: ChargePointStatus = ChargePointStatus.finishing,
 ) -> VirtualCharger:
     return VirtualCharger(
         charger_id,
@@ -36,6 +39,7 @@ def make_charger(
         reboot_delay=REBOOT_DELAY,
         call_timeout=2.0,
         max_power_w=max_power_w,
+        plugged_status_after_reboot=plugged_status_after_reboot,
     )
 
 

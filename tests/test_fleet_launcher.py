@@ -20,16 +20,26 @@ from sim import assert_closed_cleanly
 JITTER = 10.0
 
 
+def _template(prefix: str, connectors: int, count: int) -> ChargerTemplate:
+    name = prefix.rstrip("-")
+    return ChargerTemplate(
+        id_prefix=prefix,
+        vendor=f"Vend{name}",
+        model=f"Mod{name}",
+        connectors=connectors,
+        count=count,
+        current="AC",
+    )
+
+
 def _fleet(seed: int = 7, extra: bool = False) -> Fleet:
     """3 chargers (2 + 1), plus a 4th from another template if `extra`."""
     templates = [
-        ChargerTemplate(id_prefix="A-", vendor="VendA", model="ModA", connectors=2, count=2),
-        ChargerTemplate(id_prefix="B-", vendor="VendB", model="ModB", connectors=1, count=1),
+        _template("A-", connectors=2, count=2),
+        _template("B-", connectors=1, count=1),
     ]
     if extra:
-        templates.insert(
-            0, ChargerTemplate(id_prefix="X-", vendor="VendX", model="ModX", connectors=3, count=1)
-        )
+        templates.insert(0, _template("X-", connectors=3, count=1))
     # The CSMS harness imposes its own heartbeat interval; this one is not used here.
     return Fleet(
         seed=seed, heartbeat_interval=60, startup_jitter_seconds=JITTER, templates=templates

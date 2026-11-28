@@ -1,11 +1,9 @@
 """Charging sessions on a virtual charger against a real CSMS, under virtual time (ManualTime).
 
-Each step is followed by _settle(): every transaction message delivered and the charger
-asleep on a known number of timers. Only then does the test move time, so runs are exact.
+Steps and timer counts are in session_helpers.
 """
 
 import asyncio
-from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,64 +26,23 @@ from fakes import (
 )
 from manual_time import ManualTime
 from ocpp_ops.charger.charger import SessionError, VirtualCharger
-from ocpp_ops.csms.registry import ChargerState, Transaction
 from ocpp_ops.csms.server import start_server
 from ocpp_ops.message_log import LogRecord, MessageLog
+from session_helpers import (
+    CHARGING,
+    IDLE,
+    POWER_W,
+    SAMPLE_INTERVAL,
+    WH_PER_SAMPLE,
+    active_transaction,
+    advance_to,
+    boot,
+    calls,
+    charger_state,
+    settle,
+    start_session,
+)
 from sim import drop_connection, make_charger, read_log, running
-
-POWER_W = 7_200  # 2 Wh per second: easy exact numbers
-SAMPLE_INTERVAL = 60  # MeterValueSampleInterval default
-WH_PER_SAMPLE = POWER_W * SAMPLE_INTERVAL // 3600  # 120 Wh
-# Timers while idle and online: the heartbeat. During a transaction: + meter sampling.
-IDLE = 1
-CHARGING = 2
-
-
-def _charger(csms: CsmsHarness) -> ChargerState:
-    state = csms.registry.get("CP_1")
-    assert state is not None
-    return state
-
-
-def _active(csms: CsmsHarness, connector_id: int = 1) -> Transaction:
-    transaction = _charger(csms).transaction_on(connector_id)
-    assert transaction is not None, f"no active transaction on connector {connector_id}"
-    return transaction
-
-
-async def _settle(time: ManualTime, charger: VirtualCharger, sleepers: int) -> None:
-    """Wait until every transaction message is delivered and `sleepers` timers are set."""
-    await wait_until(lambda: charger.queued_messages == 0 and time.sleeper_count == sleepers)
-
-
-async def _advance_to(time: ManualTime, until: datetime, settled: Callable[[], Any]) -> None:
-    """Wake the timers one at a time up to `until`, waiting for `settled()` after each."""
-    while (deadline := time.next_deadline) is not None and deadline <= until:
-        time.advance_to_next()
-        await settled()
-
-
-async def _boot(time: ManualTime, csms: CsmsHarness, charger: VirtualCharger) -> None:
-    await wait_until(lambda: csms.registry.get("CP_1") is not None and charger.booted)
-    await _settle(time, charger, IDLE)
-
-
-async def _start_session(
-    time: ManualTime, charger: VirtualCharger, connector_id: int = 1, sleepers: int = CHARGING
-) -> None:
-    await charger.plug_in(connector_id)
-    assert await charger.authorize(connector_id, ACCEPTED_TAG) == AuthorizationStatus.accepted
-    await charger.start(connector_id)
-    await _settle(time, charger, sleepers)
-
-
-def _calls(records: list[LogRecord], *actions: str) -> list[LogRecord]:
-    """CALLs from the charger (as the CSMS logged them), optionally of some actions only."""
-    return [
-        r
-        for r in records
-        if r.direction == "in" and r.message_type == "CALL" and (not actions or r.action in actions)
-    ]
 
 
 def _sample(record: LogRecord) -> dict[str, str]:
@@ -101,9 +58,7 @@ def _sample(record: LogRecord) -> dict[str, str]:
 
 
 def _energy_values(records: list[LogRecord]) -> list[int]:
-    return [
-        int(_sample(r)["Energy.Active.Import.Register"]) for r in _calls(records, "MeterValues")
-    ]
+    return [int(_sample(r)["Energy.Active.Import.Register"]) for r in calls(records, "MeterValues")]
 
 
 # --- A full session --------------------------------------------------------------------
@@ -112,29 +67,29 @@ def _energy_values(records: list[LogRecord]) -> list[int]:
 async def test_full_session(time: ManualTime, sim_csms: CsmsHarness) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
+        await boot(time, sim_csms, charger)
 
         await charger.plug_in(1)
-        assert _charger(sim_csms).connectors[1].status == S.preparing
+        assert charger_state(sim_csms).connectors[1].status == S.preparing
 
         assert await charger.authorize(1, ACCEPTED_TAG) == AuthorizationStatus.accepted
         started_at = time()
         transaction = await charger.start(1)
-        await _settle(time, charger, CHARGING)
+        await settle(time, charger, CHARGING)
 
         assert transaction.transaction_id == 1  # from StartTransaction.conf
-        assert _charger(sim_csms).connectors[1].status == S.charging
-        active = _active(sim_csms)
+        assert charger_state(sim_csms).connectors[1].status == S.charging
+        active = active_transaction(sim_csms)
         assert (active.id, active.id_tag, active.meter_start) == (1, ACCEPTED_TAG, 0)
         assert active.started_at == started_at
 
         # Two samples, at the interval from the start (a heartbeat comes in between).
-        await _advance_to(
+        await advance_to(
             time,
             started_at + timedelta(seconds=2 * SAMPLE_INTERVAL),
-            lambda: _settle(time, charger, CHARGING),
+            lambda: settle(time, charger, CHARGING),
         )
-        samples = _calls(read_log(sim_csms.log_path), "MeterValues")
+        samples = calls(read_log(sim_csms.log_path), "MeterValues")
         assert [r.timestamp for r in samples] == [
             started_at + timedelta(seconds=SAMPLE_INTERVAL),
             started_at + timedelta(seconds=2 * SAMPLE_INTERVAL),
@@ -144,13 +99,13 @@ async def test_full_session(time: ManualTime, sim_csms: CsmsHarness) -> None:
             {"Energy.Active.Import.Register": "120", "Power.Active.Import": "7200"},
             {"Energy.Active.Import.Register": "240", "Power.Active.Import": "7200"},
         ]
-        assert _active(sim_csms).energy_wh == 240
+        assert active_transaction(sim_csms).energy_wh == 240
 
         stopped_at = time()
         await charger.stop(1)
-        await _settle(time, charger, IDLE)  # sampling stopped
+        await settle(time, charger, IDLE)  # sampling stopped
 
-        state = _charger(sim_csms)
+        state = charger_state(sim_csms)
         assert state.connectors[1].status == S.finishing
         assert state.active_transactions == {}
         [finished] = state.finished_transactions
@@ -159,14 +114,14 @@ async def test_full_session(time: ManualTime, sim_csms: CsmsHarness) -> None:
         assert (finished.duration_s, finished.stop_reason) == (120, Reason.local)
 
         await charger.unplug(1)
-        assert _charger(sim_csms).connectors[1].status == S.available
+        assert charger_state(sim_csms).connectors[1].status == S.available
         assert charger.transaction(1) is None
 
     # The whole session as the CSMS logged it, in order (after the 3 boot statuses): each
     # status before its transaction message, as our charger sends them.
     session = [
         (r.action, r.payload.get("status"))
-        for r in _calls(read_log(sim_csms.log_path))
+        for r in calls(read_log(sim_csms.log_path))
         if r.action not in ("BootNotification", "Heartbeat")
     ][3:]
     assert session == [
@@ -180,7 +135,7 @@ async def test_full_session(time: ManualTime, sim_csms: CsmsHarness) -> None:
         ("StopTransaction", None),
         ("StatusNotification", "Available"),
     ]
-    stop_call = _calls(read_log(sim_csms.log_path), "StopTransaction")[0]
+    stop_call = calls(read_log(sim_csms.log_path), "StopTransaction")[0]
     assert stop_call.payload == {
         "meterStop": 240,
         "timestamp": stopped_at.isoformat(),
@@ -193,31 +148,31 @@ async def test_full_session(time: ManualTime, sim_csms: CsmsHarness) -> None:
 async def test_ev_unplugged_while_charging(time: ManualTime, sim_csms: CsmsHarness) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger)
         started_at = time()
-        await _advance_to(
+        await advance_to(
             time,
             started_at + timedelta(seconds=SAMPLE_INTERVAL),
-            lambda: _settle(time, charger, CHARGING),
+            lambda: settle(time, charger, CHARGING),
         )
 
         await charger.unplug(1)
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
 
-        state = _charger(sim_csms)
+        state = charger_state(sim_csms)
         assert state.connectors[1].status == S.available
         [finished] = state.finished_transactions
         assert (finished.stop_reason, finished.meter_stop) == (Reason.ev_disconnected, 120)
 
     records = read_log(sim_csms.log_path)
-    [stop_call] = _calls(records, "StopTransaction")
+    [stop_call] = calls(records, "StopTransaction")
     assert stop_call.payload["reason"] == "EVDisconnected"
     assert "idTag" not in stop_call.payload  # nobody presented a tag to stop it
     # §4.9: Finishing with info "EV side disconnected", then Available.
     statuses = [
         (r.payload["status"], r.payload.get("info"))
-        for r in _calls(records, "StatusNotification")
+        for r in calls(records, "StatusNotification")
         if r.payload["connectorId"] == 1
     ]
     assert statuses[-2:] == [("Finishing", "EV side disconnected"), ("Available", None)]
@@ -236,17 +191,17 @@ async def test_refused_tag_starts_nothing(
 ) -> None:
     charger = make_charger(sim_csms.url, time)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
+        await boot(time, sim_csms, charger)
         await charger.plug_in(1)
 
         assert await charger.authorize(1, id_tag) == expected
 
-        assert _charger(sim_csms).connectors[1].status == S.available
+        assert charger_state(sim_csms).connectors[1].status == S.available
         with pytest.raises(SessionError, match="is Available"):
             await charger.start(1)
 
-    assert _charger(sim_csms).active_transactions == {}
-    assert _calls(read_log(sim_csms.log_path), "StartTransaction") == []
+    assert charger_state(sim_csms).active_transactions == {}
+    assert calls(read_log(sim_csms.log_path), "StartTransaction") == []
 
 
 async def test_session_actions_check_the_connector_state(
@@ -254,7 +209,7 @@ async def test_session_actions_check_the_connector_state(
 ) -> None:
     charger = make_charger(sim_csms.url, time)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
+        await boot(time, sim_csms, charger)
 
         with pytest.raises(SessionError, match="is Available"):
             await charger.authorize(1, ACCEPTED_TAG)  # nothing plugged in
@@ -282,18 +237,18 @@ async def test_stop_then_unplug_order_on_the_wire(
     sends them, whatever validation is slower (ocpp validates in a thread)."""
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger)
         if slow is not None:
             hold_validation(monkeypatch, lambda c: c.action == slow, lambda: asyncio.sleep(0.05))
 
         await charger.stop(1)
         await charger.unplug(1)
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
 
     tail = [
         (r.action, r.payload.get("status"))
-        for r in _calls(read_log(sim_csms.log_path), "StatusNotification", "StopTransaction")
+        for r in calls(read_log(sim_csms.log_path), "StatusNotification", "StopTransaction")
     ][-3:]
     assert tail == [
         ("StatusNotification", "Finishing"),
@@ -310,21 +265,21 @@ async def test_meter_keeps_counting_across_sessions(
 ) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger)
-        await _advance_to(
-            time, time() + timedelta(seconds=90), lambda: _settle(time, charger, CHARGING)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger)
+        await advance_to(
+            time, time() + timedelta(seconds=90), lambda: settle(time, charger, CHARGING)
         )
         await charger.stop(1)  # after 84 s (two heartbeats, one sample at 60 s): 168 Wh
         await charger.unplug(1)
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
         # Idle for a while: no power, no energy.
-        await _advance_to(time, time() + timedelta(seconds=200), lambda: _settle(time, charger, 1))
+        await advance_to(time, time() + timedelta(seconds=200), lambda: settle(time, charger, 1))
         assert charger.meter_wh(1) == 168
 
-        await _start_session(time, charger)
+        await start_session(time, charger)
 
-        second = _active(sim_csms)
+        second = active_transaction(sim_csms)
         # §7.31: the register is not reset at the start of a transaction.
         assert second.meter_start == 168
         assert charger.meter_wh(2) == 0  # each connector has its own meter
@@ -333,19 +288,20 @@ async def test_meter_keeps_counting_across_sessions(
 async def test_two_connectors_charge_at_once(time: ManualTime, sim_csms: CsmsHarness) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger, connector_id=1, sleepers=2)
-        await _start_session(time, charger, connector_id=2, sleepers=3)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger, connector_id=1, sleepers=2)
+        await start_session(time, charger, connector_id=2, sleepers=3)
         start = time()
-        await _advance_to(
+        await advance_to(
             time,
             start + timedelta(seconds=SAMPLE_INTERVAL),
-            lambda: _settle(time, charger, 3),
+            lambda: settle(time, charger, 3),
         )
 
         # No load sharing: each connector draws the full power.
-        assert (_active(sim_csms, 1).energy_wh, _active(sim_csms, 2).energy_wh) == (120, 120)
-        assert {_active(sim_csms, 1).id, _active(sim_csms, 2).id} == {1, 2}
+        first, second = active_transaction(sim_csms, 1), active_transaction(sim_csms, 2)
+        assert (first.energy_wh, second.energy_wh) == (120, 120)
+        assert {first.id, second.id} == {1, 2}
 
 
 # --- MeterValueSampleInterval ----------------------------------------------------------
@@ -356,11 +312,11 @@ async def test_sample_interval_change_applies_at_once(
 ) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger)
         started_at = time()
         time.advance_to_next()  # the first heartbeat, at 42 s
-        await _settle(time, charger, CHARGING)
+        await settle(time, charger, CHARGING)
         changed_at = time()
         assert changed_at == started_at + timedelta(seconds=HEARTBEAT_INTERVAL)
 
@@ -368,12 +324,12 @@ async def test_sample_interval_change_applies_at_once(
             "CP_1", "MeterValueSampleInterval", "15"
         )
         assert result.status == "Accepted"
-        await _settle(time, charger, CHARGING)  # the 60 s timer was replaced
+        await settle(time, charger, CHARGING)  # the 60 s timer was replaced
 
-        await _advance_to(
-            time, changed_at + timedelta(seconds=30), lambda: _settle(time, charger, CHARGING)
+        await advance_to(
+            time, changed_at + timedelta(seconds=30), lambda: settle(time, charger, CHARGING)
         )
-        samples = _calls(read_log(sim_csms.log_path), "MeterValues")
+        samples = calls(read_log(sim_csms.log_path), "MeterValues")
         # Counted from the change, not from the start (which would give 45 s, 60 s).
         assert [r.timestamp for r in samples] == [
             changed_at + timedelta(seconds=15),
@@ -381,11 +337,9 @@ async def test_sample_interval_change_applies_at_once(
         ]
 
         await sim_csms.central_system.change_configuration("CP_1", "MeterValueSampleInterval", "0")
-        await _settle(time, charger, IDLE)  # no sampling timer at all, only the heartbeat
-        await _advance_to(
-            time, time() + timedelta(seconds=300), lambda: _settle(time, charger, IDLE)
-        )
-        assert len(_calls(read_log(sim_csms.log_path), "MeterValues")) == 2
+        await settle(time, charger, IDLE)  # no sampling timer at all, only the heartbeat
+        await advance_to(time, time() + timedelta(seconds=300), lambda: settle(time, charger, IDLE))
+        assert len(calls(read_log(sim_csms.log_path), "MeterValues")) == 2
 
 
 async def test_sample_interval_zero_sends_no_meter_values(
@@ -394,17 +348,15 @@ async def test_sample_interval_zero_sends_no_meter_values(
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     charger.config.change("MeterValueSampleInterval", "0")
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger, sleepers=IDLE)
-        await _advance_to(
-            time, time() + timedelta(seconds=300), lambda: _settle(time, charger, IDLE)
-        )
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger, sleepers=IDLE)
+        await advance_to(time, time() + timedelta(seconds=300), lambda: settle(time, charger, IDLE))
         await charger.stop(1)
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
 
-    assert _calls(read_log(sim_csms.log_path), "MeterValues") == []
+    assert calls(read_log(sim_csms.log_path), "MeterValues") == []
     # The transaction itself is still complete: the CSMS learns the energy at the stop.
-    [finished] = _charger(sim_csms).finished_transactions
+    [finished] = charger_state(sim_csms).finished_transactions
     assert finished.energy_wh == 294 * 2  # the last heartbeat was at 294 s, 2 Wh/s
 
 
@@ -428,13 +380,13 @@ async def test_messages_queued_offline_are_delivered_in_order_after_reconnect(
 ) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with AsyncExitStack() as restarted, running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger)
         started_at = time()
-        await _advance_to(
+        await advance_to(
             time,
             started_at + timedelta(seconds=SAMPLE_INTERVAL),
-            lambda: _settle(time, charger, CHARGING),
+            lambda: settle(time, charger, CHARGING),
         )
 
         # The CSMS stops accepting connections (it keeps its state), then the network drops.
@@ -443,7 +395,7 @@ async def test_messages_queued_offline_are_delivered_in_order_after_reconnect(
         await _offline_settle(time, charger, CHARGING)  # sampling + reconnect backoff
 
         # Offline: reconnect attempts fail, samples go on and are queued.
-        await _advance_to(
+        await advance_to(
             time,
             started_at + timedelta(seconds=3 * SAMPLE_INTERVAL),
             lambda: _offline_settle(time, charger, CHARGING),
@@ -452,14 +404,14 @@ async def test_messages_queued_offline_are_delivered_in_order_after_reconnect(
         await charger.stop(1)
         await _offline_settle(time, charger, 1)  # only the backoff timer left
         assert charger.queued_messages == 3  # MeterValues at 120 s and 180 s, StopTransaction
-        assert _active(sim_csms).id == 1  # the CSMS doesn't know yet
+        assert active_transaction(sim_csms).id == 1  # the CSMS doesn't know yet
 
         await _restart_listening(restarted, sim_csms)
         time.advance_to_next()  # reconnect
         await wait_until(lambda: charger.booted)
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
 
-        state = _charger(sim_csms)
+        state = charger_state(sim_csms)
         assert state.active_transactions == {}
         [finished] = state.finished_transactions
         expected_wh = int((stopped_at - started_at).total_seconds()) * 2
@@ -474,7 +426,7 @@ async def test_messages_queued_offline_are_delivered_in_order_after_reconnect(
     reconnected_at = max(r.timestamp for r in records if r.message_type == "CONNECTED")
     after_reconnect = [
         (r.action, r.payload.get("status"), r.payload.get("connectorId"))
-        for r in _calls(records)
+        for r in calls(records)
         if r.timestamp >= reconnected_at and r.action != "Heartbeat"
     ]
     # §4.2 then §3.7: boot, every status, then the queue in order.
@@ -489,7 +441,7 @@ async def test_messages_queued_offline_are_delivered_in_order_after_reconnect(
         ("StatusNotification", "Available", 1),
     ]
     # Delivered late, but with the time they were taken.
-    samples = _calls(records, "MeterValues")
+    samples = calls(records, "MeterValues")
     assert [r.payload["meterValue"][0]["timestamp"] for r in samples] == [
         (started_at + timedelta(seconds=n * SAMPLE_INTERVAL)).isoformat() for n in (1, 2, 3)
     ]
@@ -505,7 +457,7 @@ async def test_start_while_offline_gets_its_id_after_reconnect(
 ) -> None:
     charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
     async with AsyncExitStack() as restarted, running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
+        await boot(time, sim_csms, charger)
         await charger.plug_in(1)
         assert await charger.authorize(1, ACCEPTED_TAG) == AuthorizationStatus.accepted
 
@@ -516,7 +468,7 @@ async def test_start_while_offline_gets_its_id_after_reconnect(
         started_at = time()
         transaction = await charger.start(1)  # offline: StartTransaction is queued
         await _offline_settle(time, charger, CHARGING)
-        await _advance_to(
+        await advance_to(
             time,
             started_at + timedelta(seconds=SAMPLE_INTERVAL),
             lambda: _offline_settle(time, charger, CHARGING),
@@ -529,15 +481,15 @@ async def test_start_while_offline_gets_its_id_after_reconnect(
         while not charger.booted:
             time.advance_to_next()
             await wait_until(lambda: charger.booted or time.sleeper_count == CHARGING)
-        await _settle(time, charger, CHARGING)
+        await settle(time, charger, CHARGING)
 
         assert transaction.transaction_id == 1
-        active = _active(sim_csms)
+        active = active_transaction(sim_csms)
         assert (active.id, active.started_at) == (1, started_at)
-        assert _charger(sim_csms).anomalies == []
+        assert charger_state(sim_csms).anomalies == []
         # The MeterValues queued before the id was known went out with it.
         records = read_log(sim_csms.log_path)
-        assert {r.payload["transactionId"] for r in _calls(records, "MeterValues")} == {1}
+        assert {r.payload["transactionId"] for r in calls(records, "MeterValues")} == {1}
         assert active.energy_wh == _energy_values(records)[-1]
         assert _energy_values(records)[0] == WH_PER_SAMPLE
 
@@ -563,7 +515,7 @@ def _fail(monkeypatch: pytest.MonkeyPatch, csms: CsmsHarness, method: str, times
 
 async def _quiet_charger(time: ManualTime, csms: CsmsHarness, charger: VirtualCharger) -> None:
     """Boot, then no heartbeats and no sampling: only retry timers are left to watch."""
-    await _boot(time, csms, charger)
+    await boot(time, csms, charger)
     await csms.central_system.change_configuration("CP_1", "HeartbeatInterval", "0")
     await wait_until(lambda: time.sleeper_count == 0)
 
@@ -586,13 +538,13 @@ async def test_failed_start_is_retried_with_growing_waits(
         assert time.advance_to_next() == 60
         await wait_until(lambda: time.sleeper_count == 1)
         assert time.advance_to_next() == 120
-        await _settle(time, charger, 0)
+        await settle(time, charger, 0)
 
         assert transaction.transaction_id == 1
-        assert _active(sim_csms).started_at == started_at  # the original start time
+        assert active_transaction(sim_csms).started_at == started_at  # the original start time
 
     records = read_log(sim_csms.log_path)
-    attempts = _calls(records, "StartTransaction")
+    attempts = calls(records, "StartTransaction")
     assert [r.timestamp - started_at for r in attempts] == [
         timedelta(seconds=0),
         timedelta(seconds=60),
@@ -616,19 +568,19 @@ async def test_start_given_up_after_attempts_then_minus_one(
         transaction = await charger.start(1)
         await wait_until(lambda: time.sleeper_count == 1)
         assert time.advance_to_next() == 60
-        await _settle(time, charger, 0)  # second failure: discarded, no more waiting
+        await settle(time, charger, 0)  # second failure: discarded, no more waiting
 
         # Errata 3.18: no id will ever come; later messages say -1.
         assert transaction.transaction_id == -1
         await charger.stop(1)
-        await _settle(time, charger, 0)
+        await settle(time, charger, 0)
 
     records = read_log(sim_csms.log_path)
-    assert len(_calls(records, "StartTransaction")) == 2
-    [stop_call] = _calls(records, "StopTransaction")
+    assert len(calls(records, "StartTransaction")) == 2
+    [stop_call] = calls(records, "StopTransaction")
     assert stop_call.payload["transactionId"] == -1
     # Answered anyway, and visible to the agent.
-    [anomaly] = _charger(sim_csms).anomalies
+    [anomaly] = charger_state(sim_csms).anomalies
     assert (anomaly.action, anomaly.transaction_id) == ("StopTransaction", -1)
 
 
@@ -640,7 +592,7 @@ def _status_and_stop_calls(records: list[LogRecord], since: datetime) -> list[tu
         (r.action, r.payload.get("connectorId"), r.payload.get("status"))
         if r.action == "StatusNotification"
         else (r.action, r.payload["transactionId"])
-        for r in _calls(records, "StatusNotification", "StopTransaction")
+        for r in calls(records, "StatusNotification", "StopTransaction")
         if r.timestamp >= since
     ]
 
@@ -656,7 +608,7 @@ async def test_status_does_not_wait_through_a_retry_backoff(
     charger.config.change("MeterValueSampleInterval", "0")
     async with running(charger, csms=sim_csms):
         await _quiet_charger(time, sim_csms, charger)
-        await _start_session(time, charger, sleepers=0)
+        await start_session(time, charger, sleepers=0)
         stopped_at = time()
 
         await charger.stop(1)
@@ -665,9 +617,9 @@ async def test_status_does_not_wait_through_a_retry_backoff(
 
         assert time() == stopped_at  # no virtual time passed: Available did not wait 60 s
         assert charger.queued_messages == 1  # the StopTransaction, backing off
-        assert _charger(sim_csms).connectors[1].status == S.available
+        assert charger_state(sim_csms).connectors[1].status == S.available
         assert time.advance_to_next() == 60
-        await _settle(time, charger, 0)
+        await settle(time, charger, 0)
 
     # The last four: virtual time never moved, so timestamps can't tell boot from stop.
     assert _status_and_stop_calls(read_log(sim_csms.log_path), stopped_at)[-4:] == [
@@ -689,8 +641,8 @@ async def test_status_behind_another_connectors_retry_does_not_wait(
     charger.config.change("MeterValueSampleInterval", "0")
     async with running(charger, csms=sim_csms):
         await _quiet_charger(time, sim_csms, charger)
-        await _start_session(time, charger, connector_id=1, sleepers=0)
-        await _start_session(time, charger, connector_id=2, sleepers=0)
+        await start_session(time, charger, connector_id=1, sleepers=0)
+        await start_session(time, charger, connector_id=2, sleepers=0)
         await charger.stop(2)
         await wait_until(lambda: time.sleeper_count == 1)  # its StopTransaction backs off
         await charger.stop(1)
@@ -702,7 +654,7 @@ async def test_status_behind_another_connectors_retry_does_not_wait(
         assert time() == stopped_at
         assert charger.queued_messages == 2  # both StopTransactions still queued
         assert time.advance_to_next() == 60
-        await _settle(time, charger, 0)
+        await settle(time, charger, 0)
 
     assert _status_and_stop_calls(read_log(sim_csms.log_path), stopped_at)[-6:] == [
         ("StatusNotification", 2, "Finishing"),
@@ -725,9 +677,9 @@ async def test_a_fault_does_not_wait_for_a_pending_stop(
     charger = make_charger(sim_csms.url, time)
     charger.config.change("MeterValueSampleInterval", "0")
     async with AsyncExitStack() as restarted, running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger, connector_id=1, sleepers=IDLE)
-        await _start_session(time, charger, connector_id=2, sleepers=IDLE)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger, connector_id=1, sleepers=IDLE)
+        await start_session(time, charger, connector_id=2, sleepers=IDLE)
         sim_csms.server.close(close_connections=False)
         drop_connection(charger)
         await _offline_settle(time, charger, 1)
@@ -760,7 +712,7 @@ async def test_a_fault_does_not_wait_for_a_pending_stop(
         await wait_until(lambda: charger.connector(1).status == target)
         release.set()
         await change
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
 
     after_reconnect = _status_and_stop_calls(read_log(sim_csms.log_path), reconnect_at)[3:]
     if fault:
@@ -786,8 +738,8 @@ async def test_status_waiting_when_the_connection_drops(
     charger = make_charger(sim_csms.url, time)
     charger.config.change("MeterValueSampleInterval", "0")
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger, sleepers=IDLE)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger, sleepers=IDLE)
         held, release = asyncio.Event(), asyncio.Event()
 
         async def hold() -> None:
@@ -809,7 +761,7 @@ async def test_status_waiting_when_the_connection_drops(
         release.set()
         reconnect_at = time() + timedelta(seconds=time.advance_to_next())
         await wait_until(lambda: charger.booted)
-        await _settle(time, charger, IDLE)
+        await settle(time, charger, IDLE)
 
     assert _status_and_stop_calls(read_log(sim_csms.log_path), reconnect_at) == [
         ("StatusNotification", 0, "Available"),
@@ -817,7 +769,7 @@ async def test_status_waiting_when_the_connection_drops(
         ("StatusNotification", 2, "Available"),
         ("StopTransaction", 1),
     ]
-    assert _charger(sim_csms).finished_transactions[0].stop_reason == Reason.local
+    assert charger_state(sim_csms).finished_transactions[0].stop_reason == Reason.local
 
 
 async def test_set_status_from_the_sender_task_is_refused(
@@ -843,7 +795,7 @@ async def test_set_status_from_the_sender_task_is_refused(
     charger.config.change("MeterValueSampleInterval", "0")
     async with running(charger, csms=sim_csms):
         await _quiet_charger(time, sim_csms, charger)
-        await _start_session(time, charger, sleepers=0)
+        await start_session(time, charger, sleepers=0)
         armed = True
         await charger.stop(1)
         await wait_until(lambda: bool(errors))
@@ -863,26 +815,26 @@ async def _scenario(seed: int, run_dir: Path) -> tuple[list[tuple[Any, ...]], ..
         async with running_csms(time, run_dir / "csms.jsonl") as csms:
             charger = make_charger(csms.url, time, seed=seed, log=log, max_power_w=POWER_W)
             async with running(charger, csms=csms):
-                await _boot(time, csms, charger)
-                await _start_session(time, charger)
-                await _advance_to(
-                    time, time() + timedelta(seconds=130), lambda: _settle(time, charger, CHARGING)
+                await boot(time, csms, charger)
+                await start_session(time, charger)
+                await advance_to(
+                    time, time() + timedelta(seconds=130), lambda: settle(time, charger, CHARGING)
                 )
                 await charger.stop(1)
                 await charger.unplug(1)
-                await _settle(time, charger, IDLE)
+                await settle(time, charger, IDLE)
 
-                await _start_session(time, charger, connector_id=2)
+                await start_session(time, charger, connector_id=2)
                 drop_connection(charger)
                 await _offline_settle(time, charger, CHARGING)  # sampling + backoff
                 assert time.advance_to_next() < 1  # the seeded backoff: 0.5-1 s
                 await wait_until(lambda: charger.booted)
-                await _settle(time, charger, CHARGING)
-                await _advance_to(
-                    time, time() + timedelta(seconds=70), lambda: _settle(time, charger, CHARGING)
+                await settle(time, charger, CHARGING)
+                await advance_to(
+                    time, time() + timedelta(seconds=70), lambda: settle(time, charger, CHARGING)
                 )
                 await charger.unplug(2)
-                await _settle(time, charger, IDLE)
+                await settle(time, charger, IDLE)
 
     def lines(path: Path) -> list[tuple[Any, ...]]:
         return [
@@ -921,6 +873,6 @@ async def test_stop_mid_transaction_is_clean(time: ManualTime, sim_csms: CsmsHar
     with the rest, and the connection still closes with 1001 (checked by running())."""
     charger = make_charger(sim_csms.url, time)
     async with running(charger, csms=sim_csms):
-        await _boot(time, sim_csms, charger)
-        await _start_session(time, charger)
+        await boot(time, sim_csms, charger)
+        await start_session(time, charger)
     assert time.sleeper_count == 0  # every timer cancelled: nothing left running

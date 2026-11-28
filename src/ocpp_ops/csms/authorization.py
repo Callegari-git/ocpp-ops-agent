@@ -30,12 +30,15 @@ class AuthorizationList:
     """idTag -> status. Lookups ignore case: IdToken is a case-insensitive string (§7.28)."""
 
     def __init__(self, id_tags: dict[str, ListedStatus] | None = None) -> None:
-        self._statuses = {
-            tag.casefold(): AuthorizationStatus(status) for tag, status in (id_tags or {}).items()
-        }
+        self._listed = {tag: AuthorizationStatus(status) for tag, status in (id_tags or {}).items()}
+        self._statuses = {tag.casefold(): status for tag, status in self._listed.items()}
 
     def status(self, id_tag: str) -> AuthorizationStatus:
         return self._statuses.get(id_tag.casefold(), AuthorizationStatus.invalid)
+
+    def tags_with(self, statuses: set[AuthorizationStatus]) -> list[str]:
+        """The listed tags with one of these statuses, as spelled and ordered in the list."""
+        return [tag for tag, status in self._listed.items() if status in statuses]
 
 
 def load_authorization_list(path: Path) -> AuthorizationList:

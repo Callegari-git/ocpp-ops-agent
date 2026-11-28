@@ -12,6 +12,7 @@ from typing import TextIO
 
 from ocpp.v16.enums import ChargePointStatus as S
 
+from ocpp_ops.charger.state_machine import IN_USE
 from ocpp_ops.clock import Clock, Sleep
 from ocpp_ops.fleet.status_rows import (
     ChargerRow,
@@ -19,6 +20,7 @@ from ocpp_ops.fleet.status_rows import (
     Issue,
     attention,
     connector_counts,
+    sessions_and_power,
 )
 
 GAP = "  "  # between grid cells
@@ -30,7 +32,6 @@ DOT = "●"
 GREEN, BLUE, YELLOW, RED, GRAY = "32", "34", "33", "31", "90"
 _RESET = "\x1b[0m"
 
-IN_USE = {S.preparing, S.charging, S.suspended_ev, S.suspended_evse, S.finishing}
 # Order of the per-status counts in the summary line.
 _STATUS_ORDER = [
     S.available,
@@ -70,8 +71,10 @@ def summary(rows: list[ChargerRow], now: datetime) -> str:
     booted = sum(row.online for row in rows)
     counts = connector_counts(rows)
     statuses = ", ".join(f"{counts[s]} {s.value}" for s in _STATUS_ORDER if counts.get(s))
+    sessions, watts = sessions_and_power(rows)
     return (
         f"{now:%H:%M:%S} UTC  {connected}/{len(rows)} connected, {booted} booted"
+        f"  |  {sessions} session{'' if sessions == 1 else 's'}, {watts / 1000:.1f} kW"
         f"  |  connectors: {statuses or 'none online'}"
     )
 

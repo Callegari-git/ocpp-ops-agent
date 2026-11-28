@@ -15,6 +15,8 @@ from ocpp.v16 import call
 from ocpp.v16.datatypes import MeterValue, SampledValue
 from ocpp.v16.enums import (
     AuthorizationStatus,
+    AvailabilityStatus,
+    AvailabilityType,
     ChargePointErrorCode,
     ChargePointStatus,
     ConfigurationStatus,
@@ -34,7 +36,7 @@ from ocpp_ops.cancellation import is_cancelling
 from ocpp_ops.charger.config import ConfigStore
 from ocpp_ops.charger.meter import EnergyMeter
 from ocpp_ops.charger.protocol import ChargerChargePoint
-from ocpp_ops.charger.state_machine import ConnectorState, check_transition
+from ocpp_ops.charger.state_machine import IN_USE, ConnectorState, check_transition
 from ocpp_ops.charger.transactions import (
     UNKNOWN_TRANSACTION_ID,
     ChargerTransaction,
@@ -55,6 +57,10 @@ BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
 # Each connector of an AC charger on a 3-phase 16 A supply: 3 x 230 V x 16 A ~ 11 kW.
 DEFAULT_MAX_POWER_W = 11_000
+# What a connector with a cable still plugged in may report after a reboot. Vendors differ;
+# Finishing matches §7.7 ("a Transaction has stopped [...] e.g. the cable has not been
+# removed"). Available is a firmware that forgets the cable: a realistic fault.
+PLUGGED_STATUSES_AFTER_REBOOT = frozenset({S.finishing, S.preparing, S.available})
 
 
 def charger_endpoint(csms_url: str, charger_id: str) -> str:
@@ -106,7 +112,10 @@ class VirtualCharger:
         reboot_delay: float = 5.0,
         call_timeout: float = 30.0,
         max_power_w: int = DEFAULT_MAX_POWER_W,
+        plugged_status_after_reboot: ChargePointStatus = S.finishing,
     ) -> None:
+        if plugged_status_after_reboot not in PLUGGED_STATUSES_AFTER_REBOOT:
+            raise ValueError(f"cannot report {plugged_status_after_reboot} after a reboot")
         self.id = charger_id
         self.config = ConfigStore(number_of_connectors)
         self._endpoint = charger_endpoint(csms_url, charger_id)
@@ -120,6 +129,11 @@ class VirtualCharger:
         self._call_timeout = call_timeout
         # Connector 0 is the charge point as a whole; 1..N are the physical connectors.
         self._connectors = {i: ConnectorState() for i in range(number_of_connectors + 1)}
+        # Availability asked by ChangeAvailability, per connector (0 included). It lives on
+        # the charger: §4.9, Unavailable set this way "MUST be persistent across reboots".
+        # It can differ from the status for a while: a change waits for the end of use.
+        self._operative = dict.fromkeys(self._connectors, True)
+        self._plugged_status_after_reboot = plugged_status_after_reboot
         # Charging sessions. Like the config, these live on the charger, not on a
         # connection: they carry on while offline. Every charging connector draws
         # max_power_w (no load sharing: smart charging is out of scope).
@@ -138,7 +152,8 @@ class VirtualCharger:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._sender_task: asyncio.Task[None] | None = None
         self._booted = False
-        self._reset_requested = False
+        # Set by an accepted Reset just before the connection is closed; run() then reboots.
+        self._reset_type: ResetType | None = None
         # When the CSMS last answered one of our Heartbeats, by our clock. Kept across
         # sessions: it is "last seen" from the charger's side.
         self._last_heartbeat: datetime | None = None
@@ -177,6 +192,24 @@ class VirtualCharger:
     def meter_wh(self, connector_id: int) -> int:
         """The connector's Energy.Active.Import.Register now, in Wh."""
         return self._meters[connector_id].register_wh()
+
+    @property
+    def max_power_w(self) -> int:
+        """What each charging connector draws, in W (no load sharing)."""
+        return self._max_power_w
+
+    @property
+    def active_transactions(self) -> int:
+        return len(self._transactions)
+
+    @property
+    def power_w(self) -> int:
+        """Power drawn by all connectors right now, in W."""
+        return sum(meter.power_w for meter in self._meters.values())
+
+    def operative(self, connector_id: int) -> bool:
+        """The availability last asked for the connector (ChangeAvailability)."""
+        return self._operative[connector_id]
 
     @property
     def queued_messages(self) -> int:
@@ -247,9 +280,9 @@ class VirtualCharger:
         failures = 0
         while True:
             connected = await self._connect_and_serve()
-            if self._reset_requested:
-                self._reset_requested = False
-                await self._sleep(self._reboot_delay)  # the simulated reboot
+            if self._reset_type is not None:
+                reset_type, self._reset_type = self._reset_type, None
+                await self._reboot(reset_type)
                 failures = 0
                 continue
             failures = 0 if connected else failures + 1
@@ -410,9 +443,10 @@ class VirtualCharger:
     async def authorize(self, connector_id: int, id_tag: str) -> AuthorizationStatus:
         """The driver presents an idTag; the CSMS decides (Authorize, §4.1).
 
-        Not Accepted: back to Available and nothing starts. The spec has no rule for this
-        case; we end the intended usage (§4.9 B1). Needs a connection: there is no local
-        authorization list or cache.
+        Not Accepted: the use ends (back to Available, or Unavailable if that change was
+        scheduled) and nothing starts. The spec has no rule for this case; we end the
+        intended usage (§4.9 B1). Needs a connection: there is no local authorization list
+        or cache.
         """
         self._require_status(connector_id, {S.preparing})
         charge_point = self._charge_point
@@ -423,7 +457,7 @@ class VirtualCharger:
         if status == AuthorizationStatus.accepted:
             self._authorized_tags[connector_id] = id_tag
         else:
-            await self.set_status(connector_id, S.available)
+            await self._end_use(connector_id)
         return status
 
     async def start(self, connector_id: int) -> ChargerTransaction:
@@ -464,7 +498,8 @@ class VirtualCharger:
 
     async def unplug(self, connector_id: int) -> None:
         """The cable is removed. During a transaction, that is the EV side disconnecting:
-        StopTransaction with reason EVDisconnected, Charging -> Finishing -> Available.
+        StopTransaction with reason EVDisconnected, Charging -> Finishing -> Available (or
+        Unavailable, if that change was scheduled).
 
         §4.9 (StopTransactionOnEVSideDisconnect=true): a Finishing status "SHOULD be send",
         with info "EV side disconnected". The table also allows Charging -> Available (C1);
@@ -476,7 +511,19 @@ class VirtualCharger:
                 connector_id, Reason.ev_disconnected, info="EV side disconnected"
             )
         self._authorized_tags.pop(connector_id, None)
-        await self.set_status(connector_id, S.available)
+        await self._end_use(connector_id)
+
+    async def _end_use(self, connector_id: int) -> None:
+        """The connector is free again: Available, then any scheduled availability change.
+
+        From Finishing, a scheduled Unavailable is applied directly (§4.9 F8), so the
+        connector is never shown Available to a new driver in between. Preparing has no
+        direct path to Unavailable (B8 is empty): Available first, then Unavailable.
+        """
+        status = self._connectors[connector_id].status
+        direct = status == S.finishing and not self._operative[connector_id]
+        await self.set_status(connector_id, S.unavailable if direct else S.available)
+        await self._apply_availability()
 
     async def _stop_transaction(
         self, connector_id: int, reason: Reason, info: str | None = None
@@ -659,14 +706,109 @@ class VirtualCharger:
                 self._restart_sampling(connector_id)
         return status
 
-    async def reboot(self, reset_type: ResetType) -> None:
-        """Simulate the reboot after an accepted Reset (Soft and Hard alike for now).
+    def change_availability(
+        self, connector_id: int, availability: AvailabilityType
+    ) -> AvailabilityStatus:
+        """Record a ChangeAvailability request and return the answer (§5.2).
 
-        Closing the connection ends the session; run() then waits `reboot_delay` and connects
-        and boots again. Config is kept (non-volatile on real chargers), and so are connector
-        statuses: what a reboot clears is decided per fault in week 2.
+        Only records: the status changes are made by apply_availability_later(), called once
+        the answer has been sent, so the CSMS gets the answer before the StatusNotification.
+
+        Connector 0 means the charge point and all its connectors (§5.2). Accepted if every
+        connector concerned can change now (or already is as asked), Scheduled if one is in
+        use: §5.2 says so for a transaction in progress; we also schedule for Preparing and
+        Finishing, which have no direct path to Unavailable in the §4.9 table. A Faulted
+        connector stays Faulted (Accepted, recorded for when the fault clears).
         """
-        logger.info("%s: %s reset, rebooting", self.id, reset_type.value)
-        self._reset_requested = True
+        if connector_id not in self._connectors:
+            return AvailabilityStatus.rejected
+        operative = availability == AvailabilityType.operative
+        concerned = self.connector_ids if connector_id == 0 else [connector_id]
+        for i in concerned:
+            self._operative[i] = operative
+        if any(self._waits_for_end_of_use(i) for i in concerned):
+            return AvailabilityStatus.scheduled
+        return AvailabilityStatus.accepted
+
+    def apply_availability_later(self) -> None:
+        """Apply recorded availability changes in a session task (from a protocol handler,
+        which must not wait for its own StatusNotifications)."""
+        self._start_session_task(self._apply_availability)
+
+    async def _apply_availability(self) -> None:
+        """Bring every connector's status in line with its requested availability, except
+        connectors in use: they change at the end of use (see _end_use).
+
+        Connector 0 changes last, once no connector 1..N still has a change waiting: with a
+        session in progress, a Scheduled charge-point-wide change is not done yet.
+        """
+        for i in self.connector_ids[1:]:
+            if self._needs_change(i) and not self._waits_for_end_of_use(i):
+                await self.set_status(i, S.available if self._operative[i] else S.unavailable)
+        waiting = any(self._needs_change(i) for i in self.connector_ids[1:])
+        if self._needs_change(0) and not waiting:
+            await self.set_status(0, S.available if self._operative[0] else S.unavailable)
+
+    def _needs_change(self, connector_id: int) -> bool:
+        """The status doesn't match the requested availability (Faulted is left alone)."""
+        status = self._connectors[connector_id].status
+        if self._operative[connector_id]:
+            return status == S.unavailable
+        return status not in (S.unavailable, S.faulted)
+
+    def _waits_for_end_of_use(self, connector_id: int) -> bool:
+        return self._needs_change(connector_id) and self._connectors[connector_id].status in IN_USE
+
+    def reset_later(self, reset_type: ResetType) -> None:
+        """Start an accepted Reset, once its answer has been sent (protocol @after handler).
+
+        It runs as a session task, tracked and cancelled with the session, rather than in
+        the untracked task ocpp creates for an async @after handler.
+        """
+        self._start_session_task(lambda: self._reset(reset_type))
+
+    async def _reset(self, reset_type: ResetType) -> None:
+        """Close the connection to reboot; run() then calls _reboot().
+
+        §5.14 (as rewritten by errata 3.36): before a soft reset, stop ongoing transactions
+        gracefully and send their StopTransaction; one that gets no answer stays queued. A
+        hard reset restarts at once: the StopTransaction is sent after the reboot.
+        """
+        logger.info("%s: %s reset", self.id, reset_type.value)
+        # Recorded first: if the session ends while the soft reset stops transactions (e.g.
+        # a StopTransaction times out), run() still reboots instead of just reconnecting.
+        self._reset_type = reset_type
+        if reset_type == ResetType.soft:
+            for connector_id in list(self._transactions):
+                await self._stop_transaction(connector_id, Reason.soft_reset)
+            for connector_id in self.connector_ids[1:]:
+                stop = self._queue.last_for(connector_id)
+                if stop is not None:
+                    await self._queue.wait_for_first_attempt(stop)
         if self._websocket is not None:
             await self._websocket.close()
+
+    async def _reboot(self, reset_type: ResetType) -> None:
+        """The simulated reboot, offline, between the reset and the next connection.
+
+        Hard: transactions end without a word to the CSMS. Each one's StopTransaction
+        (reason HardReset, meter and time of the reset) waits in the queue, which is
+        non-volatile, and goes out after the next accepted boot (§5.14). Then the restart:
+        authorizations in progress are lost; config, queue, meters and requested
+        availability are kept. A connector with a cable still plugged in reports
+        `plugged_status_after_reboot`, and availability changes that were waiting are
+        applied. All of it is reported by the boot's StatusNotifications.
+        """
+        for connector_id in list(self._transactions):
+            # Soft: already stopped before the reset, unless one started in between.
+            reason = Reason.hard_reset if reset_type == ResetType.hard else Reason.soft_reset
+            await self._stop_transaction(connector_id, reason)
+        self._authorized_tags.clear()
+        await self._sleep(self._reboot_delay)
+        after = self._plugged_status_after_reboot
+        for connector_id in self.connector_ids[1:]:
+            # Only Preparing and Finishing are left: every transaction was stopped above.
+            status = self._connectors[connector_id].status
+            if status in IN_USE and status != after:
+                await self.set_status(connector_id, after)
+        await self._apply_availability()

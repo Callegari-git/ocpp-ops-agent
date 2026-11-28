@@ -16,7 +16,7 @@ seed: 3
 heartbeat_interval: 30
 startup_jitter_seconds: 0.5
 templates:
-  - {id_prefix: CLI-, vendor: V, model: M, connectors: 2, count: 3}
+  - {id_prefix: CLI-, vendor: V, model: M, connectors: 2, count: 3, current: AC}
 """
 
 

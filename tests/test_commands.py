@@ -5,7 +5,7 @@ from contextlib import suppress
 from typing import Any
 
 import pytest
-from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
+from ocpp.v16.enums import AvailabilityType, ConfigurationStatus, ResetStatus, ResetType
 
 from fakes import CsmsHarness, fake_charger, hold_validation, wait_until
 from ocpp_ops.csms.commands import (
@@ -117,6 +117,29 @@ async def test_reset(csms: CsmsHarness, reset_type: ResetType) -> None:
 
         assert (result.type, result.status) == (reset_type, ResetStatus.accepted)
         assert cp.resets == [reset_type.value]
+
+
+# --- ChangeAvailability ----------------------------------------------------------
+# Answers of the real virtual charger: test_reset_and_availability.py.
+
+
+async def test_change_availability_with_a_charger_lacking_it_raises(csms: CsmsHarness) -> None:
+    """The fake charger has no ChangeAvailability handler: ocpp answers NotImplemented."""
+    async with fake_charger(csms.url) as cp:
+        await cp.boot()
+
+        with pytest.raises(ChargerCallError) as failed:
+            await csms.central_system.change_availability("CP_1", 1, AvailabilityType.inoperative)
+
+        assert (failed.value.action, failed.value.error_code) == (
+            "ChangeAvailability",
+            "NotImplemented",
+        )
+
+
+async def test_change_availability_to_an_unknown_charger_raises(csms: CsmsHarness) -> None:
+    with pytest.raises(ChargerNotConnectedError):
+        await csms.central_system.change_availability("CP_404", 0, AvailabilityType.operative)
 
 
 # --- Errors -----------------------------------------------------------------------

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from ocpp.routing import after, on
 from ocpp.v16 import ChargePoint, call_result
-from ocpp.v16.enums import Action, ResetStatus, ResetType
+from ocpp.v16.enums import Action, AvailabilityType, ResetStatus, ResetType
 
 from ocpp_ops.cancellation import raise_if_cancelling
 from ocpp_ops.message_log import Connection
@@ -75,6 +75,21 @@ class ChargerChargePoint(ChargePoint):
         return call_result.Reset(status=ResetStatus.accepted)
 
     @after(Action.reset)
-    async def after_reset(self, type: str) -> None:
+    def after_reset(self, type: str) -> None:
         # Runs once the Accepted answer has been sent, so the CSMS gets it before we go down.
-        await self._charger.reboot(ResetType(type))
+        # Synchronous on purpose: ocpp runs an async @after handler in an untracked task.
+        self._charger.reset_later(ResetType(type))
+
+    @on(Action.change_availability)
+    def on_change_availability(
+        self, connector_id: int, type: str
+    ) -> call_result.ChangeAvailability:
+        status = self._charger.change_availability(connector_id, AvailabilityType(type))
+        return call_result.ChangeAvailability(status=status)
+
+    @after(Action.change_availability)
+    def after_change_availability(self, connector_id: int, type: str) -> None:
+        # §5.2: the StatusNotification reports the change once it has happened, so after
+        # the answer. Not from the handler itself: ocpp waits for a handler before reading
+        # the next message, so a handler waiting for the CSMS's answer would block it.
+        self._charger.apply_availability_later()

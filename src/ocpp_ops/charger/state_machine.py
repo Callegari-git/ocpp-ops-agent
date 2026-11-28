@@ -45,6 +45,10 @@ ALLOWED_TRANSITIONS: dict[ChargePointStatus, frozenset[ChargePointStatus]] = {
     ),
 }
 
+# A connector in use: an EV or a driver is there, from the first interaction until the cable
+# is removed (§7.7: Preparing ... Finishing, all "Operative" but not available to a new user).
+IN_USE = frozenset({S.preparing, S.charging, S.suspended_ev, S.suspended_evse, S.finishing})
+
 # Connector 0 is the charge point as a whole: OCPP 1.6 only allows these three statuses for
 # it, and any change between them.
 CHARGE_POINT_STATUSES = frozenset({S.available, S.unavailable, S.faulted})
