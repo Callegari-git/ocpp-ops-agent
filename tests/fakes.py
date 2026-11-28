@@ -1,13 +1,16 @@
 """Test doubles: a controllable clock, a registry that records disconnects, a fake charger."""
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
+import ocpp.charge_point
+import pytest
+from ocpp.messages import Call
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint, call, call_result
 from ocpp.v16.datatypes import MeterValue
@@ -278,3 +281,25 @@ async def wait_until(condition: Callable[[], bool], within: float = WAIT_TIMEOUT
     async with asyncio.timeout(within):
         while not condition():  # noqa: ASYNC110
             await asyncio.sleep(0.01)
+
+
+def hold_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    is_target: Callable[[Call], bool],
+    hold: Callable[[], Awaitable[None]],
+) -> None:
+    """Make ocpp's payload validation of some CALLs take longer: await `hold()` first.
+
+    ocpp's call() validates each payload in an executor thread *before* taking its lock
+    (ocpp 2.1.0, ChargePoint.call -> messages.validate_payload -> run_in_executor), so a
+    slow validation lets a later call overtake an earlier one. This makes that race
+    deterministic. Both sides validate CALLs (the receiver too), so a target is held twice.
+    """
+    original = ocpp.charge_point.validate_payload
+
+    async def validate(message: Any, ocpp_version: str) -> None:
+        if isinstance(message, Call) and is_target(message):
+            await hold()
+        await original(message, ocpp_version)
+
+    monkeypatch.setattr(ocpp.charge_point, "validate_payload", validate)

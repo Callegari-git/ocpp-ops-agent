@@ -5,6 +5,7 @@ The handlers only translate OCPP to and from VirtualCharger calls; the behavior 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -30,17 +31,26 @@ class ChargerChargePoint(ChargePoint):
         super().__init__(charger.id, connection, response_timeout=response_timeout)
         self._charger = charger
         self._new_message_id = new_message_id
+        # See send(). asyncio.Lock serves waiters first come, first served.
+        self._send_lock = asyncio.Lock()
 
     async def send(self, request: Any) -> Any:
         """Send a CALL to the CSMS and return its response.
 
+        CALLs go out in the order send() was called. ocpp's own lock is not enough: call()
+        validates the payload in an executor thread *before* taking it, so a CALL whose
+        validation finishes first can overtake an earlier one. Our lock is taken before
+        call() even starts.
+
         Message ids come from the charger's seeded RNG instead of ocpp's default uuid4(),
         so the same seed gives the same ids. suppress=False: a CALLERROR raises.
         """
-        response = await self.call(request, unique_id=self._new_message_id(), suppress=False)
-        # On Python 3.11 call() can swallow a cancellation (see raise_if_cancelling): without
-        # this, a stopped session would carry on booting or heartbeating.
-        raise_if_cancelling()
+        async with self._send_lock:
+            response = await self.call(request, unique_id=self._new_message_id(), suppress=False)
+            # On Python 3.11 call() can swallow a cancellation (see raise_if_cancelling):
+            # without this, a stopped session would carry on booting or heartbeating. The
+            # CancelledError leaves the `async with`, which releases the lock.
+            raise_if_cancelling()
         return response
 
     @on(Action.get_configuration)

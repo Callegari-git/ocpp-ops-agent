@@ -29,10 +29,10 @@ class CentralSystem:
 
     Commands are mechanism only: safety checks (guardrails) belong to the agent layer, week 3.
 
-    One command at a time per charger: ocpp's ChargePoint.call() holds a lock while it
-    waits for the answer (OCPP-J 1.6 §4.1.1, one outstanding CALL per side). A charger that
-    never answers therefore blocks every command *to that charger* until `call_timeout`
-    expires. Commands to other chargers are not affected.
+    One command at a time per charger, in the order they were asked: our command lock is
+    held while waiting for the answer (OCPP-J 1.6 §4.1.1, one outstanding CALL per side).
+    A charger that never answers therefore blocks every command *to that charger* until
+    `call_timeout` expires. Commands to other chargers are not affected.
     """
 
     def __init__(
@@ -122,8 +122,12 @@ class CentralSystem:
             raise ChargerNotConnectedError(charger_id)
         action = request.__class__.__name__
         try:
-            # suppress=False: by default ocpp returns None on a CALLERROR; we want an error.
-            response = await charge_point.call(request, suppress=False)
+            # Our lock, not only ocpp's: commands go out in the order they were asked, even
+            # when one payload takes longer to validate (see CsmsChargePoint.command_lock).
+            async with charge_point.command_lock:
+                # suppress=False: by default ocpp returns None on a CALLERROR; we want an
+                # error.
+                response = await charge_point.call(request, suppress=False)
         except TimeoutError as error:
             raise CommandTimeoutError(charger_id, action, self._call_timeout) from error
         except ConnectionClosed as error:

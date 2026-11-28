@@ -23,6 +23,7 @@ from fakes import (
     HEARTBEAT_INTERVAL,
     OCPP16,
     CsmsHarness,
+    hold_validation,
     running_csms,
     wait_until,
 )
@@ -369,6 +370,37 @@ async def test_status_changed_offline_is_reported_after_reconnect(
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+
+# --- Order of messages on the wire ------------------------------------------------------
+
+
+async def test_concurrent_sends_go_out_in_call_order(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two status changes at once: the one asked first goes out first, even when its
+    payload takes longer to validate (ocpp validates in a thread before its own lock)."""
+    async with running(make_charger(sim_csms.url, time), csms=sim_csms) as charger:
+        await wait_until(lambda: _is_booted(sim_csms))
+        hold_validation(
+            monkeypatch,
+            lambda c: c.action == "StatusNotification" and c.payload["connectorId"] == 1,
+            lambda: asyncio.sleep(0.05),
+        )
+
+        await asyncio.gather(
+            charger.set_status(1, S.unavailable), charger.set_status(2, S.unavailable)
+        )
+
+    unavailable = [
+        r.payload["connectorId"]
+        for r in _read_log(sim_csms.log_path)
+        if r.direction == "in"
+        and r.action == "StatusNotification"
+        and r.message_type == "CALL"
+        and r.payload["status"] == "Unavailable"
+    ]
+    assert unavailable == [1, 2]
 
 
 # --- Boot Pending ----------------------------------------------------------------------

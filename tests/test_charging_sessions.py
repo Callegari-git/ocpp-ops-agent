@@ -4,6 +4,7 @@ Each step is followed by _settle(): every transaction message delivered and the 
 asleep on a known number of timers. Only then does the test move time, so runs are exact.
 """
 
+import asyncio
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 from ocpp.v16.enums import AuthorizationStatus, Reason
+from ocpp.v16.enums import ChargePointErrorCode as E
 from ocpp.v16.enums import ChargePointStatus as S
 
 from fakes import (
@@ -20,6 +22,7 @@ from fakes import (
     EXPIRED_TAG,
     HEARTBEAT_INTERVAL,
     CsmsHarness,
+    hold_validation,
     running_csms,
     wait_until,
 )
@@ -268,6 +271,37 @@ async def test_session_actions_check_the_connector_state(
             await charger.plug_in(0)  # connector 0 is the charge point, not an outlet
 
 
+# --- Wire order: a status never overtakes its connector's transaction messages ----------
+
+
+@pytest.mark.parametrize("slow", [None, "StopTransaction", "StatusNotification"])
+async def test_stop_then_unplug_order_on_the_wire(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch, slow: str | None
+) -> None:
+    """stop() then unplug() at once: Finishing, StopTransaction, Available, as a real charger
+    sends them, whatever validation is slower (ocpp validates in a thread)."""
+    charger = make_charger(sim_csms.url, time, max_power_w=POWER_W)
+    async with running(charger, csms=sim_csms):
+        await _boot(time, sim_csms, charger)
+        await _start_session(time, charger)
+        if slow is not None:
+            hold_validation(monkeypatch, lambda c: c.action == slow, lambda: asyncio.sleep(0.05))
+
+        await charger.stop(1)
+        await charger.unplug(1)
+        await _settle(time, charger, IDLE)
+
+    tail = [
+        (r.action, r.payload.get("status"))
+        for r in _calls(read_log(sim_csms.log_path), "StatusNotification", "StopTransaction")
+    ][-3:]
+    assert tail == [
+        ("StatusNotification", "Finishing"),
+        ("StopTransaction", None),
+        ("StatusNotification", "Available"),
+    ]
+
+
 # --- Energy ----------------------------------------------------------------------------
 
 
@@ -511,10 +545,10 @@ async def test_start_while_offline_gets_its_id_after_reconnect(
 # --- Failures to process: TransactionMessageAttempts / RetryInterval (§3.7.1) -----------
 
 
-def _fail_starts(monkeypatch: pytest.MonkeyPatch, csms: CsmsHarness, times: int) -> None:
-    """The CSMS fails to process the next `times` StartTransactions: ocpp answers an
-    exception in a handler with a CALLERROR (InternalError)."""
-    original = csms.registry.start_transaction
+def _fail(monkeypatch: pytest.MonkeyPatch, csms: CsmsHarness, method: str, times: int) -> None:
+    """The CSMS fails to process the next `times` calls of a registry method (e.g.
+    "start_transaction"): ocpp answers an exception in a handler with a CALLERROR."""
+    original = getattr(csms.registry, method)
     remaining = times
 
     def flaky(*args: Any, **kwargs: Any) -> int:
@@ -524,7 +558,7 @@ def _fail_starts(monkeypatch: pytest.MonkeyPatch, csms: CsmsHarness, times: int)
             raise RuntimeError("simulated CSMS failure")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(csms.registry, "start_transaction", flaky)
+    monkeypatch.setattr(csms.registry, method, flaky)
 
 
 async def _quiet_charger(time: ManualTime, csms: CsmsHarness, charger: VirtualCharger) -> None:
@@ -537,7 +571,7 @@ async def _quiet_charger(time: ManualTime, csms: CsmsHarness, charger: VirtualCh
 async def test_failed_start_is_retried_with_growing_waits(
     time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fail_starts(monkeypatch, sim_csms, times=2)
+    _fail(monkeypatch, sim_csms, "start_transaction", times=2)
     charger = make_charger(sim_csms.url, time)
     charger.config.change("MeterValueSampleInterval", "0")
     async with running(charger, csms=sim_csms):
@@ -571,7 +605,7 @@ async def test_failed_start_is_retried_with_growing_waits(
 async def test_start_given_up_after_attempts_then_minus_one(
     time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fail_starts(monkeypatch, sim_csms, times=99)
+    _fail(monkeypatch, sim_csms, "start_transaction", times=99)
     charger = make_charger(sim_csms.url, time)
     charger.config.change("MeterValueSampleInterval", "0")
     charger.config.change("TransactionMessageAttempts", "2")
@@ -596,6 +630,226 @@ async def test_start_given_up_after_attempts_then_minus_one(
     # Answered anyway, and visible to the agent.
     [anomaly] = _charger(sim_csms).anomalies
     assert (anomaly.action, anomaly.transaction_id) == ("StopTransaction", -1)
+
+
+# --- Statuses and queued transaction messages ------------------------------------------
+
+
+def _status_and_stop_calls(records: list[LogRecord], since: datetime) -> list[tuple[Any, ...]]:
+    return [
+        (r.action, r.payload.get("connectorId"), r.payload.get("status"))
+        if r.action == "StatusNotification"
+        else (r.action, r.payload["transactionId"])
+        for r in _calls(records, "StatusNotification", "StopTransaction")
+        if r.timestamp >= since
+    ]
+
+
+async def test_status_does_not_wait_through_a_retry_backoff(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """unplug() right after stop(): Available waits for the StopTransaction's first attempt
+    only. That attempt fails (CALLERROR), so Available goes out at once, not after the
+    60 s retry backoff."""
+    _fail(monkeypatch, sim_csms, "stop_transaction", times=1)
+    charger = make_charger(sim_csms.url, time)
+    charger.config.change("MeterValueSampleInterval", "0")
+    async with running(charger, csms=sim_csms):
+        await _quiet_charger(time, sim_csms, charger)
+        await _start_session(time, charger, sleepers=0)
+        stopped_at = time()
+
+        await charger.stop(1)
+        async with asyncio.timeout(2):  # fail, not hang, if Available waits for the retry
+            await charger.unplug(1)
+
+        assert time() == stopped_at  # no virtual time passed: Available did not wait 60 s
+        assert charger.queued_messages == 1  # the StopTransaction, backing off
+        assert _charger(sim_csms).connectors[1].status == S.available
+        assert time.advance_to_next() == 60
+        await _settle(time, charger, 0)
+
+    # The last four: virtual time never moved, so timestamps can't tell boot from stop.
+    assert _status_and_stop_calls(read_log(sim_csms.log_path), stopped_at)[-4:] == [
+        ("StatusNotification", 1, "Finishing"),
+        ("StopTransaction", 1),  # CALLERROR
+        ("StatusNotification", 1, "Available"),
+        ("StopTransaction", 1),  # the retry, 60 s later
+    ]
+
+
+async def test_status_behind_another_connectors_retry_does_not_wait(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Connector 2's StopTransaction fails and backs off for 60 s; connector 1's waits
+    behind it, never attempted. unplug(1) still sends Available at once: a status never
+    sits behind a retry backoff, whichever connector it belongs to."""
+    _fail(monkeypatch, sim_csms, "stop_transaction", times=1)
+    charger = make_charger(sim_csms.url, time)
+    charger.config.change("MeterValueSampleInterval", "0")
+    async with running(charger, csms=sim_csms):
+        await _quiet_charger(time, sim_csms, charger)
+        await _start_session(time, charger, connector_id=1, sleepers=0)
+        await _start_session(time, charger, connector_id=2, sleepers=0)
+        await charger.stop(2)
+        await wait_until(lambda: time.sleeper_count == 1)  # its StopTransaction backs off
+        await charger.stop(1)
+        stopped_at = time()
+
+        async with asyncio.timeout(2):  # fail, not hang, if Available waits for the retry
+            await charger.unplug(1)
+
+        assert time() == stopped_at
+        assert charger.queued_messages == 2  # both StopTransactions still queued
+        assert time.advance_to_next() == 60
+        await _settle(time, charger, 0)
+
+    assert _status_and_stop_calls(read_log(sim_csms.log_path), stopped_at)[-6:] == [
+        ("StatusNotification", 2, "Finishing"),
+        ("StopTransaction", 2),  # CALLERROR, then 60 s backoff
+        ("StatusNotification", 1, "Finishing"),
+        ("StatusNotification", 1, "Available"),
+        ("StopTransaction", 2),
+        ("StopTransaction", 1),
+    ]
+
+
+@pytest.mark.parametrize("fault", [True, False], ids=["Faulted", "unplug"])
+async def test_a_fault_does_not_wait_for_a_pending_stop(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch, fault: bool
+) -> None:
+    """Both transactions are stopped offline. After the reconnect, connector 2's
+    StopTransaction is being sent (held in validation) and connector 1's waits behind it.
+    A fault on connector 1 goes out before connector 1's StopTransaction; an ordinary status
+    (unplug: Available) goes out after it."""
+    charger = make_charger(sim_csms.url, time)
+    charger.config.change("MeterValueSampleInterval", "0")
+    async with AsyncExitStack() as restarted, running(charger, csms=sim_csms):
+        await _boot(time, sim_csms, charger)
+        await _start_session(time, charger, connector_id=1, sleepers=IDLE)
+        await _start_session(time, charger, connector_id=2, sleepers=IDLE)
+        sim_csms.server.close(close_connections=False)
+        drop_connection(charger)
+        await _offline_settle(time, charger, 1)
+        await charger.stop(2)
+        await charger.stop(1)
+        assert charger.queued_messages == 2  # StopTransaction 2, then StopTransaction 1
+
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def hold() -> None:
+            held.set()
+            await release.wait()
+
+        hold_validation(
+            monkeypatch,
+            lambda c: c.action == "StopTransaction" and c.payload["transactionId"] == 2,
+            hold,
+        )
+        await _restart_listening(restarted, sim_csms)
+        reconnect_at = time() + timedelta(seconds=time.advance_to_next())
+        await wait_until(held.is_set)  # StopTransaction 2 is on its way, 1 is behind it
+
+        if fault:
+            change = asyncio.create_task(charger.set_status(1, S.faulted, E.ground_failure))
+            target = S.faulted
+        else:
+            change = asyncio.create_task(charger.unplug(1))
+            target = S.available
+        # Stored before any wait: once visible, the change is waiting (queue or send lock).
+        await wait_until(lambda: charger.connector(1).status == target)
+        release.set()
+        await change
+        await _settle(time, charger, IDLE)
+
+    after_reconnect = _status_and_stop_calls(read_log(sim_csms.log_path), reconnect_at)[3:]
+    if fault:
+        assert after_reconnect == [
+            ("StopTransaction", 2),
+            ("StatusNotification", 1, "Faulted"),
+            ("StopTransaction", 1),
+        ]
+    else:
+        assert after_reconnect == [
+            ("StopTransaction", 2),
+            ("StopTransaction", 1),
+            ("StatusNotification", 1, "Available"),
+        ]
+
+
+async def test_status_waiting_when_the_connection_drops(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """unplug() waits for the StopTransaction, whose sending is held; the connection drops.
+    The wait ends at once without sending (the new status is stored); after the reconnect,
+    the boot reports Available, then the StopTransaction is delivered."""
+    charger = make_charger(sim_csms.url, time)
+    charger.config.change("MeterValueSampleInterval", "0")
+    async with running(charger, csms=sim_csms):
+        await _boot(time, sim_csms, charger)
+        await _start_session(time, charger, sleepers=IDLE)
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def hold() -> None:
+            held.set()
+            await release.wait()
+
+        hold_validation(monkeypatch, lambda c: c.action == "StopTransaction", hold)
+        await charger.stop(1)
+        await wait_until(held.is_set)
+        unplug = asyncio.create_task(charger.unplug(1))
+        await wait_until(lambda: charger.connector(1).status == S.available)  # now waiting
+
+        drop_connection(charger)
+        await _offline_settle(time, charger, 1)
+        await wait_until(unplug.done)  # the session's end released it, before any reconnect
+        await unplug
+        assert charger.queued_messages == 1  # the StopTransaction was never sent
+
+        release.set()
+        reconnect_at = time() + timedelta(seconds=time.advance_to_next())
+        await wait_until(lambda: charger.booted)
+        await _settle(time, charger, IDLE)
+
+    assert _status_and_stop_calls(read_log(sim_csms.log_path), reconnect_at) == [
+        ("StatusNotification", 0, "Available"),
+        ("StatusNotification", 1, "Available"),  # reported by the boot
+        ("StatusNotification", 2, "Available"),
+        ("StopTransaction", 1),
+    ]
+    assert _charger(sim_csms).finished_transactions[0].stop_reason == Reason.local
+
+
+async def test_set_status_from_the_sender_task_is_refused(
+    time: ManualTime, sim_csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sender waiting for its own deliveries would deadlock: refused loudly instead.
+    Here the sender's retry-backoff sleep tries a status change."""
+    _fail(monkeypatch, sim_csms, "stop_transaction", times=1)
+    errors: list[str] = []
+    armed = False
+
+    async def sleep(seconds: float) -> None:
+        nonlocal armed
+        if armed:  # the only sleeper after stop(): the sender, about to back off
+            armed = False
+            try:
+                await charger.set_status(2, S.unavailable)
+            except RuntimeError as error:
+                errors.append(str(error))
+        await time.sleep(seconds)
+
+    charger = make_charger(sim_csms.url, time, sleep=sleep)
+    charger.config.change("MeterValueSampleInterval", "0")
+    async with running(charger, csms=sim_csms):
+        await _quiet_charger(time, sim_csms, charger)
+        await _start_session(time, charger, sleepers=0)
+        armed = True
+        await charger.stop(1)
+        await wait_until(lambda: bool(errors))
+
+    assert errors == ["set_status() must not be called from the transaction sender"]
+    assert charger.connector(2).status == S.available  # nothing changed
 
 
 # --- Reproducibility -------------------------------------------------------------------

@@ -136,6 +136,7 @@ class VirtualCharger:
         self._charge_point: ChargerChargePoint | None = None
         self._session_tasks: asyncio.TaskGroup | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._sender_task: asyncio.Task[None] | None = None
         self._booted = False
         self._reset_requested = False
         # When the CSMS last answered one of our Heartbeats, by our clock. Kept across
@@ -196,16 +197,33 @@ class VirtualCharger:
         Checks the transition (raises InvalidTransitionError), stores the new state, then
         sends a StatusNotification if booted. While offline the change is only stored: every
         status is reported after the next boot anyway.
+
+        A status does not overtake its connector's transaction messages queued before it
+        (e.g. stop() then unplug(): Finishing, StopTransaction, Available), but waits at most
+        for their first delivery attempt, never through retry backoffs. Faulted never waits:
+        faults are reported at once (§3.7 lets non-transaction messages go immediately).
         """
+        if asyncio.current_task() is self._sender_task:
+            # The sender would wait for its own deliveries: a deadlock. It never changes
+            # statuses; this keeps it that way.
+            raise RuntimeError("set_status() must not be called from the transaction sender")
         if connector_id not in self._connectors:
             raise ValueError(f"{self.id} has no connector {connector_id}")
         current = self._connectors[connector_id]
         check_transition(connector_id, current.status, status, error_code)
         # Stored before any await, so nothing can interleave between check and update.
         self._connectors[connector_id] = ConnectorState(status, error_code, info)
-        if self._booted and self._charge_point is not None:
-            with suppress(ConnectionClosed):  # dropped now: reported after the next boot
-                await self._send_status(self._charge_point, connector_id)
+        charge_point = self._charge_point
+        if not self._booted or charge_point is None:
+            return
+        if status != S.faulted:
+            earlier = self._queue.last_for(connector_id)
+            if earlier is not None:
+                await self._queue.wait_for_first_attempt(earlier)
+            if self._charge_point is not charge_point:
+                return  # the session ended while waiting: reported after the next boot
+        with suppress(ConnectionClosed):  # dropped now: reported after the next boot
+            await self._send_status(charge_point, connector_id)
 
     # --- Lifecycle ---
 
@@ -280,6 +298,8 @@ class VirtualCharger:
             self._charge_point = None
             self._session_tasks = None
             self._heartbeat_task = None
+            self._sender_task = None
+            self._queue.interrupt()  # a status waiting for the queue gives up (see set_status)
             if logging_connection is not None:
                 logging_connection.record_event("DISCONNECTED", close_info)
 
@@ -325,7 +345,9 @@ class VirtualCharger:
         self._restart_heartbeat()
         # OCPP 1.6 §4.2 / §3.7: transaction messages queued while offline go out only after
         # an accepted boot, here after the statuses, then new ones as they come.
-        self._start_session_task(lambda: self._deliver_transaction_messages(charge_point))
+        self._sender_task = self._start_session_task(
+            lambda: self._deliver_transaction_messages(charge_point)
+        )
 
     def _start_session_task(
         self, make: Callable[[], Coroutine[Any, Any, None]]
@@ -493,9 +515,8 @@ class VirtualCharger:
     def _queue_message(self, transaction: ChargerTransaction, request: TransactionRequest) -> None:
         """Every transaction-related message goes through the queue, online or not.
 
-        Callers queue *after* their own StatusNotification has been answered. The order
-        can't be left to ocpp's call lock: call() validates each payload in a worker thread
-        before taking the lock, so two concurrent calls can take it in either order.
+        Callers queue *after* their own StatusNotification has been answered, so on the
+        wire the status comes first (start: Charging then StartTransaction).
         """
         self._queue.put(QueuedMessage(transaction, request))
 
@@ -514,19 +535,30 @@ class VirtualCharger:
                 response = await charge_point.send(message.payload())
             except OCPPError as error:
                 # OCPP-J errata 3.2: a CALLERROR is how a CSMS reports "failure to process".
+                self._queue.mark_attempted(message)
                 logger.warning("%s: CSMS failed to process %s: %r", self.id, message, error)
                 if not self._give_up_after_failure(message):
-                    retry_interval = self.config.transaction_message_retry_interval
-                    await self._sleep(retry_interval * message.failures)
+                    await self._back_off(message)
                 continue
             except TimeoutError:
                 # No answer counts as a failure too (§4.8, §4.10: the charger "will try the
                 # same message again"). Like any timeout it ends the session; the message is
                 # resent after the next boot.
+                self._queue.mark_attempted(message)
                 self._give_up_after_failure(message)
                 raise
+            self._queue.mark_attempted(message)
             self._queue.drop_first()
             self._on_delivered(message, response)
+
+    async def _back_off(self, message: QueuedMessage) -> None:
+        """Wait before resending: TransactionMessageRetryInterval x failures so far. Statuses
+        waiting for the queue go out meanwhile (see set_status)."""
+        self._queue.set_backing_off(True)
+        try:
+            await self._sleep(self.config.transaction_message_retry_interval * message.failures)
+        finally:
+            self._queue.set_backing_off(False)
 
     def _give_up_after_failure(self, message: QueuedMessage) -> bool:
         """Count a failed transmission of the first queued message. True if dropped."""

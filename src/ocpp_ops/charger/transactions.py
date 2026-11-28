@@ -43,6 +43,8 @@ class QueuedMessage:
     request: TransactionRequest
     # Times the CSMS failed to process it (CALLERROR or no answer), for the retry rules.
     failures: int = 0
+    # True once its first delivery attempt has ended, whatever the outcome.
+    attempted: bool = False
 
     def __str__(self) -> str:
         """Short form for log lines, e.g. "StartTransaction (connector 1, 2 failures)"."""
@@ -65,14 +67,60 @@ class QueuedMessage:
 
 
 class TransactionQueue:
-    """FIFO of transaction-related messages. Lives on the charger: survives reconnects."""
+    """FIFO of transaction-related messages. Lives on the charger: survives reconnects.
+
+    It also lets a StatusNotification wait for the transaction messages of its connector
+    (see wait_for_first_attempt).
+    """
 
     def __init__(self) -> None:
         self._messages: deque[QueuedMessage] = deque()
         self._not_empty = asyncio.Event()
+        # True while the sender waits TransactionMessageRetryInterval before a retry.
+        self._backing_off = False
+        # Set (then replaced) whenever something a waiter cares about changes.
+        self._progress = asyncio.Event()
+        # Counts interrupt() calls: a waiter stops when it changes (the session ended).
+        self._interruptions = 0
 
     def __len__(self) -> int:
         return len(self._messages)
+
+    def last_for(self, connector_id: int) -> QueuedMessage | None:
+        """The most recently queued message of a connector, if any is still queued."""
+        for message in reversed(self._messages):
+            if message.transaction.connector_id == connector_id:
+                return message
+        return None
+
+    def mark_attempted(self, message: QueuedMessage) -> None:
+        message.attempted = True
+        self._notify()
+
+    def set_backing_off(self, backing_off: bool) -> None:
+        self._backing_off = backing_off
+        self._notify()
+
+    def interrupt(self) -> None:
+        """The session ended: every wait_for_first_attempt() returns."""
+        self._interruptions += 1
+        self._notify()
+
+    async def wait_for_first_attempt(self, message: QueuedMessage) -> None:
+        """Wait until `message` has been sent once (answered, failed or timed out), or the
+        sender is backing off before a retry, or the session ends (interrupt()).
+
+        The backoff bound keeps a status from sitting behind 60-120 s of retries, even when
+        `message` itself is still waiting behind another connector's retried message.
+        """
+        interruptions = self._interruptions
+        while not (message.attempted or self._backing_off or self._interruptions != interruptions):
+            await self._progress.wait()
+
+    def _notify(self) -> None:
+        # Wake every current waiter; later waiters get a fresh event.
+        self._progress.set()
+        self._progress = asyncio.Event()
 
     def put(self, message: QueuedMessage) -> None:
         self._messages.append(message)

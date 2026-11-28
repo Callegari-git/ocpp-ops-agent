@@ -9,6 +9,7 @@ from pathlib import Path
 from fakes import CsmsHarness, wait_until
 from manual_time import ManualTime
 from ocpp_ops.charger.charger import DEFAULT_MAX_POWER_W, VirtualCharger
+from ocpp_ops.clock import Sleep
 from ocpp_ops.message_log import LogRecord, MessageLog
 
 REBOOT_DELAY = 5.0
@@ -22,13 +23,14 @@ def make_charger(
     seed: int = 0,
     log: MessageLog | None = None,
     max_power_w: int = DEFAULT_MAX_POWER_W,
+    sleep: Sleep | None = None,
 ) -> VirtualCharger:
     return VirtualCharger(
         charger_id,
         url,
         connectors,
         now=time,
-        sleep=time.sleep,
+        sleep=sleep or time.sleep,
         rng=random.Random(seed),
         log=log,
         reboot_delay=REBOOT_DELAY,

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from ocpp.v16.enums import ConfigurationStatus, ResetStatus, ResetType
 
-from fakes import CsmsHarness, fake_charger, wait_until
+from fakes import CsmsHarness, fake_charger, hold_validation, wait_until
 from ocpp_ops.csms.commands import (
     ChargerCallError,
     ChargerNotConnectedError,
@@ -15,6 +15,7 @@ from ocpp_ops.csms.commands import (
 )
 from ocpp_ops.csms.handlers import CsmsChargePoint
 from ocpp_ops.csms.registry import ChargerState, ConfigurationKey
+from ocpp_ops.message_log import LogRecord
 
 
 def _charger(csms: CsmsHarness, charger_id: str = "CP_1") -> ChargerState:
@@ -198,3 +199,29 @@ async def test_command_cancelled_as_the_answer_arrives_raises_cancelled(
         command = asyncio.create_task(csms.central_system.get_configuration("CP_1"))
         with pytest.raises(asyncio.CancelledError):
             await command
+
+
+# --- Order of commands on the wire -------------------------------------------------
+
+
+async def test_concurrent_commands_go_out_in_request_order(
+    csms: CsmsHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two commands to one charger at once (the week-3 agent may do this): the one asked
+    first goes out first, even when its payload takes longer to validate."""
+    async with fake_charger(csms.url) as cp:
+        await cp.boot()
+        hold_validation(
+            monkeypatch, lambda c: c.action == "GetConfiguration", lambda: asyncio.sleep(0.05)
+        )
+
+        await asyncio.gather(
+            csms.central_system.get_configuration("CP_1", ["HeartbeatInterval"]),
+            csms.central_system.change_configuration("CP_1", "HeartbeatInterval", "30"),
+        )
+
+    records = [
+        LogRecord.model_validate_json(line) for line in csms.log_path.read_text().splitlines()
+    ]
+    sent = [r.action for r in records if r.direction == "out" and r.message_type == "CALL"]
+    assert sent == ["GetConfiguration", "ChangeConfiguration"]

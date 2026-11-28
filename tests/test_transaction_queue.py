@@ -76,3 +76,71 @@ def test_short_description_for_logs() -> None:
     message = _stop(_transaction())
     message.failures = 2
     assert str(message) == "StopTransaction (connector 1, 2 failures)"
+
+
+def _message(connector_id: int) -> QueuedMessage:
+    transaction = ChargerTransaction(connector_id, "TAG", 0, START)
+    return _stop(transaction)
+
+
+def test_last_for_a_connector() -> None:
+    queue = TransactionQueue()
+    a1, b2, c1 = _message(1), _message(2), _message(1)
+    for message in (a1, b2, c1):
+        queue.put(message)
+
+    assert queue.last_for(1) is c1
+    assert queue.last_for(2) is b2
+    assert queue.last_for(3) is None
+
+
+async def _waits(queue: TransactionQueue, message: QueuedMessage) -> asyncio.Task[None]:
+    waiter = asyncio.create_task(queue.wait_for_first_attempt(message))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    return waiter
+
+
+async def test_wait_ends_on_first_attempt() -> None:
+    queue = TransactionQueue()
+    message = _message(1)
+    queue.put(message)
+    waiter = await _waits(queue, message)
+
+    queue.mark_attempted(message)
+
+    await asyncio.wait_for(waiter, 1)
+
+
+async def test_wait_ends_when_the_sender_backs_off() -> None:
+    queue = TransactionQueue()
+    blocking, message = _message(2), _message(1)  # message is behind a retried one
+    queue.put(blocking)
+    queue.put(message)
+    waiter = await _waits(queue, message)
+
+    queue.set_backing_off(True)
+
+    await asyncio.wait_for(waiter, 1)
+    assert not message.attempted
+
+
+async def test_wait_ends_when_the_session_ends() -> None:
+    queue = TransactionQueue()
+    message = _message(1)
+    queue.put(message)
+    waiter = await _waits(queue, message)
+
+    queue.interrupt()
+
+    await asyncio.wait_for(waiter, 1)
+
+
+async def test_no_wait_when_already_attempted_or_backing_off() -> None:
+    queue = TransactionQueue()
+    attempted = _message(1)
+    queue.mark_attempted(attempted)
+    await asyncio.wait_for(queue.wait_for_first_attempt(attempted), 1)
+
+    queue.set_backing_off(True)
+    await asyncio.wait_for(queue.wait_for_first_attempt(_message(1)), 1)

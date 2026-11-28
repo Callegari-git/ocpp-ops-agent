@@ -5,6 +5,7 @@ camelCase keys into snake_case keyword arguments before calling these handlers. 
 the optional fields we don't use yet.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -47,6 +48,9 @@ class CsmsChargePoint(ChargePoint):
         self._authorization = authorization
         self._heartbeat_interval = heartbeat_interval
         self._now = now
+        # Taken by CentralSystem._call() so commands to this charger go out in the order
+        # they were asked (ocpp validates in a thread before its own lock). FIFO.
+        self.command_lock = asyncio.Lock()
 
     @on(Action.boot_notification)
     def on_boot_notification(
