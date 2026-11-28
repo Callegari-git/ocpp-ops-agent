@@ -91,3 +91,15 @@ def test_invalid_fleet_file_exits_with_the_error(tmp_path: Path) -> None:
     message = str(exit_info.value.code)
     assert message.startswith("Invalid fleet file:")
     assert "templates.0.count: Input should be greater than or equal to 1" in message
+
+
+def test_invalid_id_tags_file_exits_with_the_error(tmp_path: Path) -> None:
+    fleet_file = tmp_path / "fleet.yaml"
+    fleet_file.write_text(SMALL_FLEET)
+    id_tags = tmp_path / "id_tags.yaml"
+    id_tags.write_text("id_tags: {TAG-A: Valid}")
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--fleet", str(fleet_file), "--id-tags", str(id_tags)])
+    message = str(exit_info.value.code)
+    assert message.startswith("Invalid authorization file:")
+    assert "Input should be 'Accepted', 'Blocked' or 'Expired'" in message

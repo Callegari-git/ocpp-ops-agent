@@ -10,6 +10,7 @@ from websockets.exceptions import ConnectionClosed
 
 from ocpp_ops.cancellation import raise_if_cancelling
 from ocpp_ops.clock import Clock
+from ocpp_ops.csms.authorization import AuthorizationList
 from ocpp_ops.csms.commands import (
     ChangeConfigurationResult,
     ChargerCallError,
@@ -40,9 +41,11 @@ class CentralSystem:
         log: MessageLog,
         heartbeat_interval: int,
         now: Clock,
+        authorization: AuthorizationList,
         call_timeout: float = 30.0,
     ) -> None:
         self.registry = registry
+        self._authorization = authorization
         self._log = log
         self._heartbeat_interval = heartbeat_interval
         self._now = now
@@ -62,6 +65,7 @@ class CentralSystem:
             charger_id,
             logging_connection,
             self.registry,
+            self._authorization,
             self._heartbeat_interval,
             self._now,
             response_timeout=self._call_timeout,

@@ -15,6 +15,7 @@ from manual_time import ManualTime
 from ocpp_ops.fleet.config import ChargerTemplate, Fleet
 from ocpp_ops.fleet.launcher import FleetMember, build_fleet, charger_seed, run_fleet
 from ocpp_ops.message_log import LogRecord, MessageLog
+from sim import assert_closed_cleanly
 
 JITTER = 10.0
 
@@ -36,16 +37,29 @@ def _fleet(seed: int = 7, extra: bool = False) -> Fleet:
 
 
 @asynccontextmanager
-async def _running(members: list[FleetMember], time: ManualTime) -> AsyncIterator[None]:
+async def _running(
+    members: list[FleetMember], time: ManualTime, csms: CsmsHarness
+) -> AsyncIterator[None]:
+    """Run the fleet; stop it when the block exits. Every charger still connected at the
+    stop must close with 1001 (see sim.running)."""
     task = asyncio.create_task(run_fleet(members, time.sleep))
     try:
         # Every charger is parked in its start-up sleep before the test advances time.
         await wait_until(lambda: time.sleeper_count == len(members))
         yield
-    finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    except BaseException:
+        await _stop(task)
+        raise
+    connected = [member.charger.id for member in members if member.charger.connected]
+    await _stop(task)
+    for charger_id in connected:
+        await assert_closed_cleanly(csms, charger_id)
+
+
+async def _stop(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 async def _run_until(time: ManualTime, members: list[FleetMember], until: datetime) -> None:
@@ -102,7 +116,7 @@ def test_chargers_get_template_identity() -> None:
 async def test_three_chargers_boot_and_heartbeat(time: ManualTime, sim_csms: CsmsHarness) -> None:
     start = time()
     members = build_fleet(_fleet(), sim_csms.url, now=time, sleep=time.sleep)
-    async with _running(members, time):
+    async with _running(members, time, sim_csms):
         end = start + timedelta(seconds=JITTER + 2 * HEARTBEAT_INTERVAL)
         await _run_until(time, members, end)
 
@@ -141,7 +155,7 @@ async def _scenario(fleet: Fleet, run_dir: Path) -> tuple[dict[str, list[Any]], 
     with MessageLog(run_dir / "fleet.jsonl") as log:
         async with running_csms(time, run_dir / "csms.jsonl") as csms:
             members = build_fleet(fleet, csms.url, now=time, sleep=time.sleep, log=log)
-            async with _running(members, time):
+            async with _running(members, time, csms):
                 end = time() + timedelta(seconds=JITTER + 2 * HEARTBEAT_INTERVAL)
                 await _run_until(time, members, end)
     per_charger: dict[str, list[Any]] = defaultdict(list)

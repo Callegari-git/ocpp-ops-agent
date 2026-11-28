@@ -3,9 +3,15 @@
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 from ocpp_ops.clock import utc_now
+from ocpp_ops.csms.authorization import (
+    AuthorizationFileError,
+    AuthorizationList,
+    load_authorization_list,
+)
 from ocpp_ops.csms.central_system import CentralSystem
 from ocpp_ops.csms.registry import Registry
 from ocpp_ops.csms.server import start_server
@@ -31,6 +37,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to wait for a charger's answer to an outbound command",
     )
     parser.add_argument(
+        "--id-tags",
+        type=Path,
+        default=Path("id_tags.yaml"),
+        help="authorization list: idTags and their status (unknown tags are Invalid)",
+    )
+    parser.add_argument(
         "--log-file",
         type=Path,
         default=None,
@@ -43,7 +55,7 @@ def default_log_file() -> Path:
     return Path("logs") / f"csms-{utc_now():%Y%m%dT%H%M%SZ}.jsonl"
 
 
-async def run(args: argparse.Namespace, log_file: Path) -> None:
+async def run(args: argparse.Namespace, log_file: Path, authorization: AuthorizationList) -> None:
     """Serve until cancelled.
 
     On Ctrl+C, asyncio.run() cancels this coroutine. Leaving `async with server` closes
@@ -56,6 +68,7 @@ async def run(args: argparse.Namespace, log_file: Path) -> None:
             log,
             heartbeat_interval=args.heartbeat_interval,
             now=utc_now,
+            authorization=authorization,
             call_timeout=args.call_timeout,
         )
         server = await start_server(central_system, args.host, args.port)
@@ -72,9 +85,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     # The ocpp library logs every frame at INFO; the JSONL log already records them.
     logging.getLogger("ocpp").setLevel(logging.WARNING)
+    try:
+        authorization = load_authorization_list(args.id_tags)
+    except AuthorizationFileError as error:
+        sys.exit(f"Invalid authorization file:\n{error}")
     log_file = args.log_file or default_log_file()
     try:
-        asyncio.run(run(args, log_file))
+        asyncio.run(run(args, log_file, authorization))
     except KeyboardInterrupt:
         # Cleanup already happened inside run(); see its docstring.
         logger.info("CSMS stopped")

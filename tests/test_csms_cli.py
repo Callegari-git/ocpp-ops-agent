@@ -6,7 +6,10 @@ import signal
 import sys
 from pathlib import Path
 
-from fakes import fake_charger
+import pytest
+
+from fakes import DEFAULT_ID_TAGS, fake_charger
+from ocpp_ops.csms.__main__ import main
 from ocpp_ops.message_log import LogRecord
 
 
@@ -29,6 +32,8 @@ async def test_ctrl_c_closes_server_and_log(tmp_path: Path) -> None:
         "0",
         "--log-file",
         str(log_file),
+        "--id-tags",
+        str(DEFAULT_ID_TAGS),
         cwd=tmp_path,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -58,3 +63,11 @@ async def test_ctrl_c_closes_server_and_log(tmp_path: Path) -> None:
     # The server closed the connection on shutdown with 1001 (going away).
     assert records[-1].payload["reason"] == "clean"
     assert records[-1].payload["close_code"] == 1001
+
+
+def test_missing_id_tags_file_exits_with_the_error(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--id-tags", str(tmp_path / "nope.yaml")])
+    message = str(exit_info.value.code)
+    assert message.startswith("Invalid authorization file:")
+    assert "nope.yaml" in message

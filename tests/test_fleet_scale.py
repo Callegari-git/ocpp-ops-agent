@@ -10,13 +10,14 @@ from pathlib import Path
 
 import pytest
 
+from fakes import TEST_AUTHORIZATION, wait_until
 from ocpp_ops.clock import utc_now
 from ocpp_ops.csms.central_system import CentralSystem
 from ocpp_ops.csms.registry import Registry
 from ocpp_ops.csms.server import start_server
 from ocpp_ops.fleet.config import ChargerSpec, load_fleet
 from ocpp_ops.fleet.launcher import build_fleet, run_fleet
-from ocpp_ops.message_log import MessageLog
+from ocpp_ops.message_log import LogRecord, MessageLog
 
 DEFAULT_FLEET = Path(__file__).parent.parent / "fleet.yaml"
 # Generous for slow CI runners; locally it takes well under a second.
@@ -44,7 +45,11 @@ async def test_fifty_chargers_boot_within_bound(
     with MessageLog(tmp_path / "csms.jsonl") as log:
         registry = Registry(now=utc_now)
         central_system = CentralSystem(
-            registry, log, heartbeat_interval=fleet.heartbeat_interval, now=utc_now
+            registry,
+            log,
+            heartbeat_interval=fleet.heartbeat_interval,
+            now=utc_now,
+            authorization=TEST_AUTHORIZATION,
         )
         async with await start_server(central_system, "127.0.0.1", 0) as server:
             url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
@@ -61,6 +66,18 @@ async def test_fifty_chargers_boot_within_bound(
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+            # Still inside the server block: every charger closes on its own first.
+            await wait_until(lambda: not any(state.connected for state in registry.all()))
+
+    # A clean stop closes every connection with 1001, not 1011 (an error hidden behind
+    # the cancellation, see sim.running).
+    disconnects = [
+        LogRecord.model_validate_json(line)
+        for line in (tmp_path / "csms.jsonl").read_text().splitlines()
+        if '"DISCONNECTED"' in line
+    ]
+    assert len(disconnects) == 50
+    assert {record.payload["close_code"] for record in disconnects} == {1001}
 
     with capsys.disabled():  # shown in `make test` output, not captured
         print(f"\n[scale] 50 chargers booted (boot + every StatusNotification) in {elapsed:.3f} s")

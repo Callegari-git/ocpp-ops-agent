@@ -1,7 +1,7 @@
 import random
 
 import pytest
-from ocpp.v16.enums import ConfigurationStatus
+from ocpp.v16.enums import ConfigurationStatus, Measurand
 
 from ocpp_ops.charger.charger import reconnect_delay
 from ocpp_ops.charger.config import ConfigStore
@@ -37,11 +37,38 @@ def test_get_selected_keys_reports_unknown_ones() -> None:
         ("HeartbeatInterval", "abc", ConfigurationStatus.rejected),  # not an integer
         ("HeartbeatInterval", "-5", ConfigurationStatus.rejected),  # negative
         ("LocalAuthorizeOffline", "maybe", ConfigurationStatus.rejected),  # not a boolean
-        ("MeterValuesSampledData", "Voltage", ConfigurationStatus.accepted),  # free text
+        # §3.16.4: only measurands the charger supports, else the whole change is Rejected.
+        ("MeterValuesSampledData", "Power.Active.Import", ConfigurationStatus.accepted),
+        ("MeterValuesSampledData", "Power.Active.Import,Voltage", ConfigurationStatus.rejected),
+        ("MeterValuesSampledData", "", ConfigurationStatus.rejected),
     ],
 )
 def test_change(key: str, value: str, expected: ConfigurationStatus) -> None:
     assert ConfigStore(2).change(key, value) == expected
+
+
+def test_sampled_measurands_default_and_change() -> None:
+    config = ConfigStore(2)
+    # Our default adds the power to the spec's default (energy register only).
+    assert config.sampled_measurands == [
+        Measurand.energy_active_import_register,
+        Measurand.power_active_import,
+    ]
+    status = config.change(
+        "MeterValuesSampledData", " Power.Active.Import , Energy.Active.Import.Register"
+    )
+    assert status == ConfigurationStatus.accepted
+    assert config.sampled_measurands == [
+        Measurand.power_active_import,
+        Measurand.energy_active_import_register,
+    ]
+
+
+def test_transaction_keys() -> None:
+    config = ConfigStore(2)
+    assert config.meter_value_sample_interval == 60
+    assert config.transaction_message_attempts == 3
+    assert config.transaction_message_retry_interval == 60
 
 
 def test_accepted_change_is_stored_and_refused_one_is_not() -> None:

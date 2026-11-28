@@ -12,6 +12,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ocpp_ops.clock import utc_now
+from ocpp_ops.csms.authorization import (
+    AuthorizationFileError,
+    AuthorizationList,
+    load_authorization_list,
+)
 from ocpp_ops.csms.central_system import CentralSystem
 from ocpp_ops.csms.registry import Registry
 from ocpp_ops.csms.server import start_server
@@ -35,6 +40,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--port", type=int, default=9000, help="embedded CSMS port (0 picks a free port)"
     )
+    parser.add_argument(
+        "--id-tags",
+        type=Path,
+        default=Path("id_tags.yaml"),
+        help="authorization list of the embedded CSMS (not used with --csms-url)",
+    )
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="JSONL log directory")
     return parser.parse_args(argv)
 
@@ -43,7 +54,9 @@ def _log_file(log_dir: Path, name: str) -> Path:
     return log_dir / f"{name}-{utc_now():%Y%m%dT%H%M%SZ}.jsonl"
 
 
-async def run_embedded(fleet: Fleet, port: int, log_dir: Path) -> None:
+async def run_embedded(
+    fleet: Fleet, port: int, log_dir: Path, authorization: AuthorizationList
+) -> None:
     """Embedded CSMS + fleet. The CSMS-side log records every message.
 
     On Ctrl+C the fleet stops first (each charger closes with 1001 while the server is still
@@ -51,7 +64,11 @@ async def run_embedded(fleet: Fleet, port: int, log_dir: Path) -> None:
     """
     with MessageLog(_log_file(log_dir, "csms")) as log:
         central_system = CentralSystem(
-            Registry(now=utc_now), log, heartbeat_interval=fleet.heartbeat_interval, now=utc_now
+            Registry(now=utc_now),
+            log,
+            heartbeat_interval=fleet.heartbeat_interval,
+            now=utc_now,
+            authorization=authorization,
         )
         server = await start_server(central_system, "127.0.0.1", port)
         async with server:
@@ -105,7 +122,11 @@ def main(argv: list[str] | None = None) -> None:
         if args.csms_url:
             asyncio.run(run_external(fleet, args.csms_url, args.log_dir))
         else:
-            asyncio.run(run_embedded(fleet, args.port, args.log_dir))
+            try:
+                authorization = load_authorization_list(args.id_tags)
+            except AuthorizationFileError as error:
+                sys.exit(f"Invalid authorization file:\n{error}")
+            asyncio.run(run_embedded(fleet, args.port, args.log_dir, authorization))
     except KeyboardInterrupt:
         # Cleanup already happened inside run_*(); see run_embedded's docstring. Printed,
         # not logged: with the grid on, INFO logging is off.

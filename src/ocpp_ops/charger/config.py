@@ -7,9 +7,13 @@ and resets, like the non-volatile config of a real charger.
 from dataclasses import dataclass
 from typing import Literal
 
-from ocpp.v16.enums import ConfigurationStatus
+from ocpp.v16.enums import ConfigurationStatus, Measurand
 
-ValueKind = Literal["int", "bool", "text"]
+# "measurands": a comma-separated list of the measurands this charger can sample.
+ValueKind = Literal["int", "bool", "text", "measurands"]
+
+# What our meter can report (MeterValuesSampledData may only list these, §3.16.4).
+SUPPORTED_MEASURANDS = (Measurand.energy_active_import_register, Measurand.power_active_import)
 
 
 @dataclass
@@ -38,7 +42,11 @@ def standard_keys(number_of_connectors: int) -> dict[str, ConfigValue]:
         "MeterValueSampleInterval": rw("60", "int"),
         "ConnectionTimeOut": rw("60", "int"),
         "ClockAlignedDataInterval": rw("0", "int"),
-        "MeterValuesSampledData": rw("Energy.Active.Import.Register", "text"),
+        # The spec's default is the energy register alone (§9.1); ours adds the power so
+        # MeterValues show both how much and how fast.
+        "MeterValuesSampledData": rw(
+            "Energy.Active.Import.Register,Power.Active.Import", "measurands"
+        ),
         "ResetRetries": rw("3", "int"),
         "WebSocketPingInterval": rw("0", "int"),
         "LocalAuthorizeOffline": rw("true", "bool"),
@@ -85,6 +93,26 @@ class ConfigStore:
         """Seconds between heartbeats; 0 means no heartbeats."""
         return int(self._keys["HeartbeatInterval"].value)
 
+    @property
+    def meter_value_sample_interval(self) -> int:
+        """Seconds between MeterValues during a transaction; 0 means none (§9.1)."""
+        return int(self._keys["MeterValueSampleInterval"].value)
+
+    @property
+    def sampled_measurands(self) -> list[Measurand]:
+        """What each periodic MeterValues contains, in the order listed."""
+        return [Measurand(name) for name in self._keys["MeterValuesSampledData"].value.split(",")]
+
+    @property
+    def transaction_message_attempts(self) -> int:
+        """Transmissions of a transaction-related message before giving up (§3.7.1)."""
+        return int(self._keys["TransactionMessageAttempts"].value)
+
+    @property
+    def transaction_message_retry_interval(self) -> int:
+        """Seconds, multiplied by the transmissions so far, before a retry (§3.7.1)."""
+        return int(self._keys["TransactionMessageRetryInterval"].value)
+
     def set_heartbeat_interval(self, seconds: int) -> None:
         """Set by the charger itself, from BootNotification.conf (not a CSMS request)."""
         self._keys["HeartbeatInterval"].value = str(seconds)
@@ -97,4 +125,11 @@ def _normalize(value: str, kind: ValueKind) -> str | None:
     if kind == "bool":
         lowered = value.lower()
         return lowered if lowered in ("true", "false") else None
+    if kind == "measurands":
+        # §3.16.4: a measurand the charger doesn't support makes the whole change Rejected.
+        names = [name.strip() for name in value.split(",")]
+        supported = {str(measurand) for measurand in SUPPORTED_MEASURANDS}
+        if not all(name in supported for name in names):
+            return None  # also rejects "" : a MeterValues needs at least one sampled value
+        return ",".join(names)
     return value

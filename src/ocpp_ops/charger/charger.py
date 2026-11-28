@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import uuid
+from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
@@ -11,12 +12,18 @@ from urllib.parse import quote
 
 from ocpp.exceptions import OCPPError
 from ocpp.v16 import call
+from ocpp.v16.datatypes import MeterValue, SampledValue
 from ocpp.v16.enums import (
+    AuthorizationStatus,
     ChargePointErrorCode,
     ChargePointStatus,
     ConfigurationStatus,
+    Measurand,
+    ReadingContext,
+    Reason,
     RegistrationStatus,
     ResetType,
+    UnitOfMeasure,
 )
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
@@ -25,18 +32,29 @@ from websockets.typing import Subprotocol
 
 from ocpp_ops.cancellation import is_cancelling
 from ocpp_ops.charger.config import ConfigStore
+from ocpp_ops.charger.meter import EnergyMeter
 from ocpp_ops.charger.protocol import ChargerChargePoint
 from ocpp_ops.charger.state_machine import ConnectorState, check_transition
+from ocpp_ops.charger.transactions import (
+    UNKNOWN_TRANSACTION_ID,
+    ChargerTransaction,
+    QueuedMessage,
+    TransactionQueue,
+    TransactionRequest,
+)
 from ocpp_ops.clock import Clock, Sleep
 from ocpp_ops.message_log import Connection, LoggingConnection, MessageLog, describe_close
 
 logger = logging.getLogger(__name__)
+S = ChargePointStatus
 
 OCPP16 = Subprotocol("ocpp1.6")
 # OCPP 1.6 §4.2: if a Pending/Rejected answer has interval 0, the charger picks its own wait.
 BOOT_RETRY_FALLBACK_SECONDS = 60
 BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
+# Each connector of an AC charger on a 3-phase 16 A supply: 3 x 230 V x 16 A ~ 11 kW.
+DEFAULT_MAX_POWER_W = 11_000
 
 
 def charger_endpoint(csms_url: str, charger_id: str) -> str:
@@ -58,6 +76,11 @@ def reconnect_delay(failures: int, rng: random.Random) -> float:
     """
     ceiling = min(BACKOFF_MAX_SECONDS, BACKOFF_INITIAL_SECONDS * 2 ** min(failures, 10))
     return ceiling * rng.uniform(0.5, 1.0)
+
+
+class SessionError(RuntimeError):
+    """A session action (plug in, authorize, start, stop, unplug) that doesn't fit the
+    connector's current state."""
 
 
 class VirtualCharger:
@@ -82,6 +105,7 @@ class VirtualCharger:
         log: MessageLog | None = None,
         reboot_delay: float = 5.0,
         call_timeout: float = 30.0,
+        max_power_w: int = DEFAULT_MAX_POWER_W,
     ) -> None:
         self.id = charger_id
         self.config = ConfigStore(number_of_connectors)
@@ -96,6 +120,17 @@ class VirtualCharger:
         self._call_timeout = call_timeout
         # Connector 0 is the charge point as a whole; 1..N are the physical connectors.
         self._connectors = {i: ConnectorState() for i in range(number_of_connectors + 1)}
+        # Charging sessions. Like the config, these live on the charger, not on a
+        # connection: they carry on while offline. Every charging connector draws
+        # max_power_w (no load sharing: smart charging is out of scope).
+        self._max_power_w = max_power_w
+        self._meters = {i: EnergyMeter(now) for i in range(1, number_of_connectors + 1)}
+        self._authorized_tags: dict[int, str] = {}  # accepted idTag, until start()
+        self._transactions: dict[int, ChargerTransaction] = {}  # by connector
+        self._queue = TransactionQueue()
+        # Set while run() runs: tasks that outlive a connection (meter sampling).
+        self._lifetime_tasks: asyncio.TaskGroup | None = None
+        self._sampling_tasks: dict[int, asyncio.Task[None]] = {}  # by connector
         # Session state: set while connected, cleared when the connection ends.
         self._websocket: ClientConnection | None = None
         self._charge_point: ChargerChargePoint | None = None
@@ -135,6 +170,18 @@ class VirtualCharger:
     def boot_time(self) -> datetime | None:
         return self._boot_time
 
+    def transaction(self, connector_id: int) -> ChargerTransaction | None:
+        return self._transactions.get(connector_id)
+
+    def meter_wh(self, connector_id: int) -> int:
+        """The connector's Energy.Active.Import.Register now, in Wh."""
+        return self._meters[connector_id].register_wh()
+
+    @property
+    def queued_messages(self) -> int:
+        """Transaction-related messages not yet delivered to the CSMS."""
+        return len(self._queue)
+
     # --- The single path for status changes ---
 
     async def set_status(
@@ -163,7 +210,22 @@ class VirtualCharger:
     # --- Lifecycle ---
 
     async def run(self) -> None:
-        """Connect, boot and serve, reconnecting forever. Cancel the task to stop."""
+        """Connect, boot and serve, reconnecting forever. Cancel the task to stop.
+
+        Meter sampling must go on while the charger is offline, so it can't run in a
+        session's TaskGroup: it runs in this one, which lasts as long as run().
+        """
+        async with asyncio.TaskGroup() as tasks:
+            self._lifetime_tasks = tasks
+            try:
+                await self._connect_forever()
+            finally:
+                # Cleared before the TaskGroup shuts down (it cancels and awaits the sampling
+                # tasks next): from here on, nothing tries to add a task to it.
+                self._lifetime_tasks = None
+                self._sampling_tasks.clear()
+
+    async def _connect_forever(self) -> None:
         failures = 0
         while True:
             connected = await self._connect_and_serve()
@@ -261,27 +323,34 @@ class VirtualCharger:
         for connector_id in self._connectors:  # connector 0 first, then 1..N
             await self._send_status(charge_point, connector_id)
         self._restart_heartbeat()
+        # OCPP 1.6 §4.2 / §3.7: transaction messages queued while offline go out only after
+        # an accepted boot, here after the statuses, then new ones as they come.
+        self._start_session_task(lambda: self._deliver_transaction_messages(charge_point))
+
+    def _start_session_task(
+        self, make: Callable[[], Coroutine[Any, Any, None]]
+    ) -> asyncio.Task[None] | None:
+        """Add a task to the running session: the only place that does.
+
+        Called from session tasks (the boot sequence, the ChangeConfiguration handler).
+        Starts nothing if there is no session, or if the calling task is being cancelled:
+        the session is then ending, and its TaskGroup, which cancels every session task (this
+        caller included), refuses new ones (RuntimeError). `make` creates the coroutine only
+        after that check, so none is left un-awaited.
+        """
+        if self._session_tasks is None or is_cancelling():
+            return None
+        return self._session_tasks.create_task(make())
 
     def _restart_heartbeat(self) -> None:
-        """(Re)start the heartbeat loop with the current HeartbeatInterval; 0 means none.
-
-        The only place that adds a task to a running session. Called from session tasks
-        (the boot sequence, the ChangeConfiguration handler).
-        """
+        """(Re)start the heartbeat loop with the current HeartbeatInterval; 0 means none."""
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
-        if not self._booted or self._session_tasks is None or self._charge_point is None:
+        charge_point = self._charge_point
+        if not self._booted or charge_point is None or self.config.heartbeat_interval == 0:
             return
-        if is_cancelling():
-            # The session is ending: when its TaskGroup shuts down it cancels every session
-            # task, this caller included, and refuses new ones (RuntimeError). Checked before
-            # the coroutine is created, so none is left un-awaited.
-            return
-        if self.config.heartbeat_interval > 0:
-            self._heartbeat_task = self._session_tasks.create_task(
-                self._heartbeat_loop(self._charge_point)
-            )
+        self._heartbeat_task = self._start_session_task(lambda: self._heartbeat_loop(charge_point))
 
     async def _heartbeat_loop(self, charge_point: ChargerChargePoint) -> None:
         while True:
@@ -305,12 +374,257 @@ class VirtualCharger:
         """A uuid4-shaped id drawn from the seeded RNG, so the same seed gives the same ids."""
         return str(uuid.UUID(int=self._rng.getrandbits(128), version=4))
 
+    # --- Charging sessions: what a driver and an EV do at the charger ---
+    #
+    # Status changes go through set_status() like any other. Normal flow on a connector:
+    # plug_in (Available -> Preparing), authorize, start (-> Charging), stop (-> Finishing),
+    # unplug (-> Available).
+
+    async def plug_in(self, connector_id: int) -> None:
+        """An EV is plugged in: Available -> Preparing (OCPP 1.6 §4.9 A2)."""
+        self._require_status(connector_id, {S.available})
+        await self.set_status(connector_id, S.preparing)
+
+    async def authorize(self, connector_id: int, id_tag: str) -> AuthorizationStatus:
+        """The driver presents an idTag; the CSMS decides (Authorize, §4.1).
+
+        Not Accepted: back to Available and nothing starts. The spec has no rule for this
+        case; we end the intended usage (§4.9 B1). Needs a connection: there is no local
+        authorization list or cache.
+        """
+        self._require_status(connector_id, {S.preparing})
+        charge_point = self._charge_point
+        if not self._booted or charge_point is None:
+            raise SessionError(f"{self.id}: offline, cannot authorize {id_tag}")
+        response = await charge_point.send(call.Authorize(id_tag=id_tag))
+        status = AuthorizationStatus(response.id_tag_info["status"])
+        if status == AuthorizationStatus.accepted:
+            self._authorized_tags[connector_id] = id_tag
+        else:
+            await self.set_status(connector_id, S.available)
+        return status
+
+    async def start(self, connector_id: int) -> ChargerTransaction:
+        """Charging starts: Preparing -> Charging (§4.9 B3), StartTransaction queued."""
+        self._require_status(connector_id, {S.preparing})
+        id_tag = self._authorized_tags.get(connector_id)
+        if id_tag is None:
+            raise SessionError(f"{self.id}: connector {connector_id} has no accepted idTag")
+        if self._lifetime_tasks is None:
+            raise SessionError(f"{self.id}: not running")
+        del self._authorized_tags[connector_id]
+        meter = self._meters[connector_id]
+        transaction = ChargerTransaction(connector_id, id_tag, meter.register_wh(), self._now())
+        self._transactions[connector_id] = transaction
+        meter.set_power(self._max_power_w)
+        self._restart_sampling(connector_id)
+        request = call.StartTransaction(
+            connector_id=connector_id,
+            id_tag=id_tag,
+            meter_start=transaction.meter_start,
+            timestamp=transaction.started_at.isoformat(),
+        )
+        try:
+            await self.set_status(connector_id, S.charging)
+        finally:
+            # Queued after the status report, so the wire order is always StatusNotification
+            # then StartTransaction (see _queue). In `finally`: the transaction has started
+            # even if the status report failed.
+            self._queue_message(transaction, request)
+        return transaction
+
+    async def stop(self, connector_id: int, reason: Reason = Reason.local) -> None:
+        """The driver stops charging (Local: tag presented again, stop button):
+        Charging -> Finishing (§4.9 C6), StopTransaction queued. The cable is still in."""
+        if reason != Reason.local:
+            raise ValueError(f"stop() only implements reason Local, not {reason}")
+        await self._stop_transaction(connector_id, reason)
+
+    async def unplug(self, connector_id: int) -> None:
+        """The cable is removed. During a transaction, that is the EV side disconnecting:
+        StopTransaction with reason EVDisconnected, Charging -> Finishing -> Available.
+
+        §4.9 (StopTransactionOnEVSideDisconnect=true): a Finishing status "SHOULD be send",
+        with info "EV side disconnected". The table also allows Charging -> Available (C1);
+        we go through Finishing, as that paragraph describes.
+        """
+        self._require_status(connector_id, {S.preparing, S.charging, S.finishing})
+        if connector_id in self._transactions:
+            await self._stop_transaction(
+                connector_id, Reason.ev_disconnected, info="EV side disconnected"
+            )
+        self._authorized_tags.pop(connector_id, None)
+        await self.set_status(connector_id, S.available)
+
+    async def _stop_transaction(
+        self, connector_id: int, reason: Reason, info: str | None = None
+    ) -> None:
+        transaction = self._transactions.get(connector_id)
+        if transaction is None:
+            raise SessionError(f"{self.id}: no transaction on connector {connector_id}")
+        self._require_status(connector_id, {S.charging})
+        del self._transactions[connector_id]
+        self._restart_sampling(connector_id)  # no transaction any more: just stops it
+        meter = self._meters[connector_id]
+        meter.set_power(0)
+        request = call.StopTransaction(
+            meter_stop=meter.register_wh(),
+            timestamp=self._now().isoformat(),
+            transaction_id=UNKNOWN_TRANSACTION_ID,  # placeholder, set when sent
+            reason=reason,
+            # "The identifier which requested to stop" (§6.49): the driver's tag when they
+            # stop it themselves; nobody presented one when the EV side disconnected.
+            id_tag=transaction.id_tag if reason == Reason.local else None,
+        )
+        try:
+            await self.set_status(connector_id, S.finishing, info=info)
+        finally:
+            self._queue_message(transaction, request)
+
+    def _require_status(self, connector_id: int, allowed: set[ChargePointStatus]) -> None:
+        if connector_id not in self._meters:
+            raise ValueError(f"{self.id} has no connector {connector_id}")
+        status = self._connectors[connector_id].status
+        if status not in allowed:
+            raise SessionError(f"{self.id}: connector {connector_id} is {status.value}")
+
+    # --- Transaction-related messages ---
+
+    def _queue_message(self, transaction: ChargerTransaction, request: TransactionRequest) -> None:
+        """Every transaction-related message goes through the queue, online or not.
+
+        Callers queue *after* their own StatusNotification has been answered. The order
+        can't be left to ocpp's call lock: call() validates each payload in a worker thread
+        before taking the lock, so two concurrent calls can take it in either order.
+        """
+        self._queue.put(QueuedMessage(transaction, request))
+
+    async def _deliver_transaction_messages(self, charge_point: ChargerChargePoint) -> None:
+        """Send queued messages one at a time, oldest first, for as long as the session lasts.
+
+        OCPP 1.6 §3.7.1: when the CSMS fails to process a message, resend it after
+        TransactionMessageRetryInterval x the transmissions so far, and give up after
+        TransactionMessageAttempts transmissions.
+        """
+        while True:
+            message = await self._queue.first()
+            try:
+                # send() re-raises a cancellation that ocpp swallowed (Python 3.11): the
+                # message then stays queued instead of being marked delivered.
+                response = await charge_point.send(message.payload())
+            except OCPPError as error:
+                # OCPP-J errata 3.2: a CALLERROR is how a CSMS reports "failure to process".
+                logger.warning("%s: CSMS failed to process %s: %r", self.id, message, error)
+                if not self._give_up_after_failure(message):
+                    retry_interval = self.config.transaction_message_retry_interval
+                    await self._sleep(retry_interval * message.failures)
+                continue
+            except TimeoutError:
+                # No answer counts as a failure too (§4.8, §4.10: the charger "will try the
+                # same message again"). Like any timeout it ends the session; the message is
+                # resent after the next boot.
+                self._give_up_after_failure(message)
+                raise
+            self._queue.drop_first()
+            self._on_delivered(message, response)
+
+    def _give_up_after_failure(self, message: QueuedMessage) -> bool:
+        """Count a failed transmission of the first queued message. True if dropped."""
+        message.failures += 1
+        if message.failures < max(1, self.config.transaction_message_attempts):
+            return False
+        self._queue.drop_first()
+        logger.warning("%s: giving up on %s", self.id, message)
+        if isinstance(message.request, call.StartTransaction):
+            # Errata 3.18: no transactionId will ever come; later messages use -1.
+            message.transaction.transaction_id = UNKNOWN_TRANSACTION_ID
+        return True
+
+    def _on_delivered(self, message: QueuedMessage, response: Any) -> None:
+        if not isinstance(message.request, call.StartTransaction):
+            return
+        message.transaction.transaction_id = response.transaction_id
+        status = response.id_tag_info["status"]
+        if status != AuthorizationStatus.accepted:
+            # §3.5.4 StopTransactionOnInvalidId is not implemented yet: we keep charging.
+            logger.warning(
+                "%s: transaction %s started with idTag status %s; charging continues",
+                self.id,
+                response.transaction_id,
+                status,
+            )
+
+    # --- Meter sampling ---
+
+    def _restart_sampling(self, connector_id: int) -> None:
+        """(Re)start periodic MeterValues for the connector's transaction, from now.
+
+        Sampling tasks live in run()'s TaskGroup, not the session's: they go on offline. No
+        is_cancelling() check here, unlike session tasks: a session task being cancelled
+        (connection lost) must still be able to restart sampling. run() clears
+        _lifetime_tasks before its TaskGroup shuts down, so a closed group is never used.
+        """
+        old = self._sampling_tasks.pop(connector_id, None)
+        if old is not None:
+            old.cancel()
+        transaction = self._transactions.get(connector_id)
+        if transaction is None or self._lifetime_tasks is None:
+            return
+        if self.config.meter_value_sample_interval == 0:
+            return  # §9.1: 0 means "no sampled data should be transmitted"
+        self._sampling_tasks[connector_id] = self._lifetime_tasks.create_task(
+            self._sampling_loop(transaction, since=self._now())
+        )
+
+    async def _sampling_loop(self, transaction: ChargerTransaction, since: datetime) -> None:
+        """A sample every MeterValueSampleInterval from `since` (§9.1: "from the start of
+        the charging transaction"), or from the interval change.
+
+        Each wait is computed from that schedule, not "interval after the last wake-up", so
+        however late the task starts or wakes, samples stay on time and don't drift.
+        """
+        interval = timedelta(seconds=self.config.meter_value_sample_interval)
+        next_sample = since + interval
+        while True:
+            await self._sleep(max(0.0, (next_sample - self._now()).total_seconds()))
+            self._queue_message(transaction, self._meter_values(transaction.connector_id))
+            next_sample += interval
+
+    def _meter_values(self, connector_id: int) -> call.MeterValues:
+        """A periodic sample of what MeterValuesSampledData lists."""
+        meter = self._meters[connector_id]
+        sampled = []
+        for measurand in self.config.sampled_measurands:
+            if measurand == Measurand.energy_active_import_register:
+                value, unit = meter.register_wh(), UnitOfMeasure.wh
+            else:  # Power.Active.Import, the only other one the config accepts
+                value, unit = meter.power_w, UnitOfMeasure.w
+            sampled.append(
+                SampledValue(
+                    value=str(value),
+                    context=ReadingContext.sample_periodic,
+                    measurand=measurand,
+                    unit=unit,  # explicit: without it a reading means Wh (§7.43)
+                )
+            )
+        return call.MeterValues(
+            connector_id=connector_id,
+            meter_value=[MeterValue(timestamp=self._now().isoformat(), sampled_value=sampled)],
+            transaction_id=UNKNOWN_TRANSACTION_ID,  # placeholder, set when sent
+        )
+
     # --- Called by the protocol handlers ---
 
     def change_configuration(self, key: str, value: str) -> ConfigurationStatus:
         status = self.config.change(key, value)
-        if key == "HeartbeatInterval" and status == ConfigurationStatus.accepted:
-            self._restart_heartbeat()  # takes effect now, not after the next heartbeat
+        if status != ConfigurationStatus.accepted:
+            return status
+        # Both take effect now, not after the current wait.
+        if key == "HeartbeatInterval":
+            self._restart_heartbeat()
+        if key == "MeterValueSampleInterval":
+            for connector_id in self._transactions:
+                self._restart_sampling(connector_id)
         return status
 
     async def reboot(self, reset_type: ResetType) -> None:

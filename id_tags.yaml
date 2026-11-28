@@ -1,0 +1,19 @@
+# Authorization list of the CSMS: fictional idTags (RFID card ids) and their status.
+# A tag not listed here is answered Invalid (OCPP 1.6 §7.2). Lookups ignore case (§7.28).
+# idTags are at most 20 characters (CiString20Type).
+
+id_tags:
+  TAG-0001: Accepted
+  TAG-0002: Accepted
+  TAG-0003: Accepted
+  TAG-0004: Accepted
+  TAG-0005: Accepted
+  TAG-0006: Accepted
+  TAG-0007: Accepted
+  TAG-0008: Accepted
+  TAG-0009: Accepted
+  TAG-0010: Accepted
+  TAG-BLOCKED-01: Blocked
+  TAG-BLOCKED-02: Blocked
+  TAG-EXPIRED-01: Expired
+  TAG-EXPIRED-02: Expired
