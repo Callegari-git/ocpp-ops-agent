@@ -24,6 +24,9 @@ dependencies = [
 dev = [
     "pytest>=9.2,<10",
     "pytest-asyncio>=1.5,<2",
+    # Per-test timeout: a stuck task (e.g. a swallowed cancellation) fails the test instead
+    # of hanging CI.
+    "pytest-timeout>=2.4,<3",
     # Pinned exactly: new ruff releases add rules / formatting changes that would break CI.
     "ruff==0.17.6",
 ]
@@ -53,6 +56,13 @@ select = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# pytest-timeout: a test still running after 30 s fails with "Failed: Timeout", and the run
+# goes on. 30 s is far above any normal test (about 1 s at most) and above the tests' own
+# asyncio bounds, which give clearer failures first. Tests with a longer real-time bound by
+# design say so with @pytest.mark.timeout. "signal" (SIGALRM) fails only the hung test;
+# "thread" would kill the whole run at the first hang.
+timeout = 30
+timeout_method = "signal"
 # Skip locally with: pytest -m "not slow". CI runs everything.
 markers = [
     "slow: runs in real time and takes seconds (e.g. the 50-charger scale test)",

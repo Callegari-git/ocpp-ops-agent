@@ -58,6 +58,7 @@ async def _run_fleet_until(tmp_path: Path, extra_args: list[str], expected_line:
     return stderr
 
 
+@pytest.mark.timeout(60)  # a real process: up to 15 s + 10 s of its own bounds
 async def test_embedded_csms_then_ctrl_c(tmp_path: Path) -> None:
     await _run_fleet_until(tmp_path, ["--port", "0"], "3/3 connected, 3 booted")
 
@@ -71,6 +72,7 @@ async def test_embedded_csms_then_ctrl_c(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.timeout(60)  # a real process: up to 15 s + 10 s of its own bounds
 async def test_external_csms(tmp_path: Path, csms: CsmsHarness) -> None:
     await _run_fleet_until(tmp_path, ["--csms-url", csms.url], "3/3 connected, 3 booted")
 

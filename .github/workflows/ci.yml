@@ -7,6 +7,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Second safety net behind pytest-timeout: the whole job normally takes ~2 min.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

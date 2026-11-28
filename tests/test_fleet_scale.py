@@ -34,6 +34,7 @@ def _all_booted(registry: Registry, chargers: list[ChargerSpec]) -> bool:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(60)  # real time; its own boot bound (15 s) fails first
 async def test_fifty_chargers_boot_within_bound(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

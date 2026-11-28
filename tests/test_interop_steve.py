@@ -25,6 +25,8 @@ BOOT_BOUND_SECONDS = 60.0
 
 pytestmark = [
     pytest.mark.interop,
+    # Real time against an external CSMS; the 60 s boot bound fails first.
+    pytest.mark.timeout(180),
     pytest.mark.skipif(not STEVE_URL, reason="set STEVE_URL to SteVe's OCPP-J base URL"),
 ]
 
